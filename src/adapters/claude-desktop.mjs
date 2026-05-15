@@ -1,5 +1,6 @@
 import { execFile } from "node:child_process";
 import fs from "node:fs/promises";
+import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
 
@@ -30,7 +31,61 @@ async function fileExists(filePath) {
   }
 }
 
+async function readJson(filePath) {
+  const content = await fs.readFile(filePath, "utf8");
+  return JSON.parse(content.replace(/^\uFEFF/, ""));
+}
+
+async function detectMacClaude() {
+  const candidates = [
+    process.env.CLAUDE_DESKTOP_APP_PATH,
+    "/Applications/Claude.app",
+    path.join(os.homedir(), "Applications", "Claude.app")
+  ].filter(Boolean);
+
+  for (const appPath of candidates) {
+    const executable = path.join(appPath, "Contents", "MacOS", "Claude");
+    const resourcesDir = path.join(appPath, "Contents", "Resources");
+    if (!(await fileExists(executable)) || !(await fileExists(resourcesDir))) {
+      continue;
+    }
+
+    let version = null;
+    try {
+      const plist = await readJson(path.join(resourcesDir, "app.asar.unpacked", "package.json"));
+      version = plist.version || null;
+    } catch {
+      try {
+        const info = await fs.readFile(path.join(appPath, "Contents", "Info.plist"), "utf8");
+        version = /<key>CFBundleShortVersionString<\/key>\s*<string>([^<]+)<\/string>/.exec(info)?.[1] || null;
+      } catch {
+        version = null;
+      }
+    }
+
+    return {
+      kind: "mac",
+      name: "Claude",
+      packageFullName: null,
+      version,
+      installLocation: appPath,
+      executable,
+      resourcesDir
+    };
+  }
+
+  return null;
+}
+
 export async function detectClaude() {
+  if (process.platform === "darwin") {
+    return detectMacClaude();
+  }
+
+  if (process.platform !== "win32") {
+    return null;
+  }
+
   const script = `
 $ErrorActionPreference = "SilentlyContinue"
 $pkg = Get-AppxPackage -Name Claude | Sort-Object {[version]$_.Version} -Descending | Select-Object -First 1
@@ -90,6 +145,19 @@ if ($pkg) {
 }
 
 export async function isClaudeRunning() {
+  if (process.platform === "darwin") {
+    try {
+      const { stdout } = await execFileAsync("pgrep", ["-x", "Claude"], { maxBuffer: 1024 * 1024 });
+      return Boolean(stdout.trim());
+    } catch {
+      return false;
+    }
+  }
+
+  if (process.platform !== "win32") {
+    return false;
+  }
+
   const script = `
 $ErrorActionPreference = "SilentlyContinue"
 Get-Process -Name Claude | Select-Object -First 1 -ExpandProperty Id

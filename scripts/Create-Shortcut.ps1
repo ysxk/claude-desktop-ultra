@@ -1,5 +1,5 @@
 param(
-  [string]$ShortcutName = "Claude Desktop Ultra.lnk"
+  [string]$ShortcutName = "Claude ultra.lnk"
 )
 
 $ErrorActionPreference = "Stop"
@@ -23,7 +23,7 @@ if (Test-Path -LiteralPath $ExeLauncher) {
 }
 
 $Shell = New-Object -ComObject WScript.Shell
-$KnownNames = @($ShortcutName, "Claude CN.lnk")
+$KnownNames = @($ShortcutName, "Claude Desktop Ultra.lnk", "Claude CN.lnk")
 $ShortcutPath = $null
 
 foreach ($Name in $KnownNames) {
@@ -57,7 +57,7 @@ if ($RuntimeIcon) {
 } else {
   $Shortcut.IconLocation = "shell32.dll,220"
 }
-$Shortcut.Description = "Claude Desktop Ultra - non-invasive Claude Desktop enhancer"
+$Shortcut.Description = "Claude ultra - non-invasive Claude Desktop enhancer"
 $Shortcut.Save()
 
 Write-Host "Shortcut ready: $ShortcutPath"

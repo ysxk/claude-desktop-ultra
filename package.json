@@ -1,9 +1,9 @@
 {
   "name": "claude-desktop-zh-cn-overlay",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "private": true,
   "type": "module",
-  "description": "Claude Desktop Ultra - non-invasive Claude Desktop enhancer",
+  "description": "Claude ultra - non-invasive Claude Desktop enhancer",
   "bin": {
     "claude-cn": "./bin/claude-cn.mjs"
   },
@@ -13,7 +13,9 @@
     "audit": "node ./bin/claude-cn.mjs audit",
     "launch": "node ./bin/claude-cn.mjs launch",
     "generate:icon": "node ./scripts/generate-icon.mjs",
-    "build:exe": "node ./scripts/build-exe.mjs"
+    "build:exe": "node ./scripts/build-exe.mjs",
+    "build:mac": "node ./scripts/build-mac.mjs",
+    "build:dmg": "node ./scripts/build-dmg.mjs"
   },
   "pkg": {
     "scripts": [

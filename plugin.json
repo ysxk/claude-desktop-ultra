@@ -1,7 +1,7 @@
 {
   "id": "claude-desktop.zh-cn-overlay",
-  "name": "Claude Desktop Ultra",
-  "version": "0.1.4",
+  "name": "Claude ultra",
+  "version": "0.1.5",
   "entry": "bin/claude-cn.mjs",
   "target": {
     "app": "Claude Desktop",
@@ -13,7 +13,7 @@
     "nonInvasive": true,
     "writesIntoApplicationDirectory": false,
     "requiresAdministrator": false,
-    "mechanism": "Launch Claude through a portable runtime overlay with zh-CN locale, UI translation, third-party model sync, and compatibility patches."
+    "mechanism": "Launch a Claude ultra portable runtime with isolated user data, zh-CN locale, UI translation, third-party model sync, and compatibility patches."
   },
   "permissions": [
     "read-installed-claude-location",

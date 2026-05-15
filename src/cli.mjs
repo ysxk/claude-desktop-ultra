@@ -1,4 +1,6 @@
 import { execFile, spawn } from "node:child_process";
+import fs from "node:fs/promises";
+import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
@@ -7,7 +9,7 @@ import { detectClaude, isClaudeRunning } from "./adapters/claude-desktop.mjs";
 import { findAvailablePort, waitForCdp, watchAndInject } from "./cdp.mjs";
 import { buildInjectionSource } from "./injection-source.mjs";
 import { auditLocale, loadProfile, readEnglishLocale, writeMissingTemplate } from "./locale.mjs";
-import { preparePortableRuntime } from "./portable-runtime.mjs";
+import { prepareMacPortableRuntime, preparePortableRuntime } from "./portable-runtime.mjs";
 import { runWindowsSelfTest } from "./self-test.mjs";
 import { syncThirdPartyModels } from "./third-party-models.mjs";
 
@@ -18,6 +20,8 @@ const logger = {
   info: (message) => console.log(`[claude-cn] ${message}`),
   warn: (message) => console.warn(`[claude-cn] ${message}`)
 };
+
+const appDisplayName = "Claude ultra";
 
 function parseArgs(argv) {
   const args = [...argv];
@@ -55,7 +59,7 @@ function parseArgs(argv) {
 
 function printHelp() {
   console.log(`
-Claude Desktop Ultra - Claude Desktop 增强器
+Claude ultra - Claude Desktop 增强器
 
 用法：
   node ./bin/claude-cn.mjs detect
@@ -68,6 +72,8 @@ Claude Desktop Ultra - Claude Desktop 增强器
 
 说明：
   - Microsoft Store/MSIX 版会在用户目录创建便携运行时，复制 Claude 资源并覆盖 locale，不修改 WindowsApps。
+  - macOS 会创建 Claude ultra 便携增强运行时，并使用独立用户数据目录避免访问原 Claude 钥匙串项。
+  - 原版 Claude.app 当前会拦截未授权 CDP 调试参数；--experimental-cdp 仅保留用于验证。
   - classic 安装版仍使用 127.0.0.1 DevTools 端口注入 DOM 汉化层。
   - 第三方 Gateway 会优先探测可用模型并放到模型列表第一位，避免健康检查误选无权限模型。
   - doctor 会用 deepseek-v4-flash 自检汉化、模型解锁、Max 思考值和旧版配置迁移。
@@ -122,15 +128,22 @@ async function buildSource(flags) {
   };
 }
 
-function launchClaude(app, port, flags) {
+function buildRemoteDebuggingArgs(port, flags = {}) {
   const args = [
     "--remote-debugging-address=127.0.0.1",
-    `--remote-debugging-port=${port}`
+    `--remote-debugging-port=${port}`,
+    `--remote-allow-origins=http://127.0.0.1:${port}`
   ];
 
   if (flags.userDataDir) {
     args.push(`--user-data-dir=${path.resolve(flags.userDataDir)}`);
   }
+
+  return args;
+}
+
+function launchClaude(app, port, flags) {
+  const args = buildRemoteDebuggingArgs(port, flags);
 
   logger.info(`启动 Claude：${app.executable}`);
   logger.info(`DevTools 端口：127.0.0.1:${port}`);
@@ -149,11 +162,66 @@ function launchClaude(app, port, flags) {
   child.unref();
 }
 
+async function launchMacClaude(app, port, flags) {
+  const args = buildRemoteDebuggingArgs(port, flags);
+
+  logger.info(`启动 Claude.app：${app.installLocation}`);
+  logger.info(`DevTools 端口：127.0.0.1:${port}`);
+
+  await execFileAsync("open", ["-a", app.installLocation, "--args", ...args], {
+    env: {
+      ...process.env,
+      CLAUDE_CN_OVERLAY: "cdp"
+    },
+    maxBuffer: 1024 * 1024
+  });
+}
+
+async function pathExists(filePath) {
+  try {
+    await fs.access(filePath);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 async function stopProcesses(processNames) {
   const uniqueNames = [...new Set(processNames.filter(Boolean))]
     .map((name) => name.replace(/[^\w.-]/g, ""))
     .filter(Boolean);
   if (uniqueNames.length === 0) {
+    return;
+  }
+
+  if (process.platform === "darwin") {
+    for (const name of uniqueNames) {
+      try {
+        await execFileAsync("pkill", ["-x", name], { maxBuffer: 1024 * 1024 });
+      } catch {
+        // pkill exits non-zero when no matching process exists.
+      }
+    }
+    const deadline = Date.now() + 15000;
+    while (Date.now() < deadline) {
+      let stillRunning = false;
+      for (const name of uniqueNames) {
+        try {
+          const { stdout } = await execFileAsync("pgrep", ["-x", name], { maxBuffer: 1024 * 1024 });
+          stillRunning ||= Boolean(stdout.trim());
+        } catch {
+          // pgrep exits non-zero when no matching process exists.
+        }
+      }
+      if (!stillRunning) {
+        break;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 250));
+    }
+    return;
+  }
+
+  if (process.platform !== "win32") {
     return;
   }
 
@@ -179,6 +247,69 @@ exit 0
     });
   } catch (error) {
     logger.warn(`旧进程清理未完全成功，继续启动：${error.message}`);
+  }
+}
+
+function escapeRegex(value) {
+  return String(value).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+async function findPidsByPattern(pattern) {
+  try {
+    const { stdout } = await execFileAsync("pgrep", ["-f", pattern], { maxBuffer: 1024 * 1024 });
+    return stdout
+      .trim()
+      .split(/\s+/)
+      .map((pid) => Number(pid))
+      .filter((pid) => Number.isInteger(pid) && pid > 0 && pid !== process.pid);
+  } catch {
+    return [];
+  }
+}
+
+async function stopMacRuntimeApp(runtimeApp) {
+  if (process.platform !== "darwin" || !runtimeApp) {
+    return;
+  }
+
+  const pattern = escapeRegex(runtimeApp);
+  let pids = await findPidsByPattern(pattern);
+  if (pids.length === 0) {
+    return;
+  }
+
+  for (const pid of pids) {
+    try {
+      process.kill(pid, "SIGTERM");
+    } catch {}
+  }
+
+  const deadline = Date.now() + 5000;
+  while (Date.now() < deadline) {
+    pids = await findPidsByPattern(pattern);
+    if (pids.length === 0) {
+      return;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 250));
+  }
+
+  for (const pid of await findPidsByPattern(pattern)) {
+    try {
+      process.kill(pid, "SIGKILL");
+    } catch {}
+  }
+}
+
+async function macSupportsArm64() {
+  if (process.platform !== "darwin") {
+    return false;
+  }
+
+  try {
+    const { stdout } = await execFileAsync("sysctl", ["-in", "hw.optional.arm64"], { maxBuffer: 1024 * 1024 });
+    return stdout.trim() === "1";
+  } catch {
+    return os.arch() === "arm64";
   }
 }
 
@@ -225,9 +356,9 @@ $argumentsText = ${powershellString(launchTarget.arguments)}
 $workingDirectory = ${powershellString(launchTarget.workingDirectory)}
 $iconPath = ${powershellString(iconPath)}
 $legacyScriptPath = ${powershellString(legacyScriptPath)}
-$shortcutName = "Claude Desktop Ultra.lnk"
-$legacyNames = @("Claude Desktop Ultra.lnk", "Claude CN.lnk")
-$description = "Claude Desktop Ultra - non-invasive Claude Desktop enhancer"
+$shortcutName = ${powershellString(`${appDisplayName}.lnk`)}
+$legacyNames = @("Claude ultra.lnk", "Claude Desktop Ultra.lnk", "Claude CN.lnk")
+$description = ${powershellString(`${appDisplayName} - non-invasive Claude Desktop enhancer`)}
 
 $shell = New-Object -ComObject WScript.Shell
 
@@ -251,7 +382,8 @@ function Is-UltraShortcut($file) {
     $existingDescription = "$($shortcut.Description)"
     $isSameTarget = $target -eq (Normalize-Path $targetPath)
     $isLegacyScript = $arguments.IndexOf($legacyScriptPath, [StringComparison]::OrdinalIgnoreCase) -ge 0
-    $isMarked = $existingDescription.IndexOf("Claude Desktop Ultra", [StringComparison]::OrdinalIgnoreCase) -ge 0 -or
+    $isMarked = $existingDescription.IndexOf("Claude ultra", [StringComparison]::OrdinalIgnoreCase) -ge 0 -or
+      $existingDescription.IndexOf("Claude Desktop Ultra", [StringComparison]::OrdinalIgnoreCase) -ge 0 -or
       $existingDescription.IndexOf("non-invasive zh-CN overlay", [StringComparison]::OrdinalIgnoreCase) -ge 0
     $isKnownName = $legacyNames -contains $name
     return $isSameTarget -or $isLegacyScript -or ($isKnownName -and $isMarked) -or ($name -eq $shortcutName)
@@ -333,6 +465,10 @@ async function ensureDesktopShortcutForLaunch(options = {}, flags = {}) {
     return null;
   }
 
+  if (process.platform !== "win32") {
+    return null;
+  }
+
   try {
     const shortcut = await ensureDesktopShortcut(rootDir, options);
     if (shortcut?.created) {
@@ -351,7 +487,7 @@ function launchPortableRuntime(runtime, profile, options = {}) {
   const locale = options.locale || profile.locale || "zh-CN";
   const args = [`--lang=${locale}`];
   if (options.port) {
-    args.push("--remote-debugging-address=127.0.0.1", `--remote-debugging-port=${options.port}`);
+    args.push(...buildRemoteDebuggingArgs(options.port));
   }
 
   const child = spawn(runtime.runtimeExe, args, {
@@ -361,12 +497,40 @@ function launchPortableRuntime(runtime, profile, options = {}) {
     env: {
       ...process.env,
       CLAUDE_CN_OVERLAY: "portable-locale",
+      CLAUDE_CN_STATUS_DIR: runtime.runtimeDir,
       LANG: locale
     }
   });
 
   child.once("error", (error) => {
     logger.warn(`启动便携 Claude 运行时失败：${error.message}`);
+  });
+  child.unref();
+  return child.pid;
+}
+
+function launchMacPortableRuntime(runtime, profile, options = {}) {
+  const locale = options.locale || profile.locale || "zh-CN";
+  const runtimeArgs = [`--lang=${locale}`];
+  const command = options.forceArm64 ? "/usr/bin/arch" : runtime.runtimeExe;
+  const args = options.forceArm64
+    ? ["-arm64", runtime.runtimeExe, ...runtimeArgs]
+    : runtimeArgs;
+  const child = spawn(command, args, {
+    cwd: path.dirname(runtime.runtimeExe),
+    detached: true,
+    stdio: "ignore",
+    env: {
+      ...process.env,
+      CLAUDE_CN_OVERLAY: "mac-portable-locale",
+      CLAUDE_CN_STATUS_DIR: runtime.runtimeDir,
+      CLAUDE_USER_DATA_DIR: runtime.userDataDir,
+      LANG: locale
+    }
+  });
+
+  child.once("error", (error) => {
+    logger.warn(`启动 macOS 便携 Claude 运行时失败：${error.message}`);
   });
   child.unref();
   return child.pid;
@@ -447,6 +611,171 @@ async function runMsixPortableLaunch(app, flags) {
   logger.info(`运行时目录：${runtime.runtimeDir}`);
 }
 
+function macClaude3pRoot() {
+  return path.join(os.homedir(), "Library", "Application Support", "Claude-3p");
+}
+
+async function seedMacPortableUserData(userDataDir) {
+  const sourceRoot = macClaude3pRoot();
+  const linked = [];
+  const entries = [
+    "claude_desktop_config.json",
+    "configLibrary",
+    "developer_settings.json",
+    "extensions-installations.json",
+    "Claude Extensions Settings",
+    "claude-code",
+    "local-agent-mode-sessions",
+    "git-worktrees.json",
+    "cowork-enabled-cli-ops.json"
+  ];
+
+  await fs.mkdir(userDataDir, { recursive: true });
+  for (const entry of entries) {
+    const source = path.join(sourceRoot, entry);
+    const destination = path.join(userDataDir, entry);
+    if (!(await pathExists(source)) || await pathExists(destination)) {
+      continue;
+    }
+    await fs.symlink(source, destination);
+    linked.push(entry);
+  }
+
+  return { sourceRoot, userDataDir, linked };
+}
+
+async function cleanupMacPortableBrowserState(userDataDir) {
+  const entries = [
+    "blob_storage",
+    "Cache",
+    "Code Cache",
+    "Cookies",
+    "Cookies-journal",
+    "DawnGraphiteCache",
+    "DawnWebGPUCache",
+    "DIPS",
+    "DIPS-wal",
+    "GPUCache",
+    "IndexedDB",
+    "Local State",
+    "Local Storage",
+    "Network Persistent State",
+    "Partitions",
+    "Preferences",
+    "Service Worker",
+    "Session Storage",
+    "Shared Dictionary",
+    "SharedStorage",
+    "TransportSecurity",
+    "Trust Tokens",
+    "Trust Tokens-journal",
+    "WebStorage"
+  ];
+  const removed = [];
+
+  for (const entry of entries) {
+    const target = path.join(userDataDir, entry);
+    if (!(await pathExists(target))) {
+      continue;
+    }
+
+    await fs.rm(target, { recursive: true, force: true });
+    removed.push(entry);
+  }
+
+  return { removed };
+}
+
+async function cleanupMacPortableKeychainItem() {
+  if (process.platform !== "darwin") {
+    return { removed: false };
+  }
+
+  try {
+    await execFileAsync("security", [
+      "delete-generic-password",
+      "-s",
+      `${appDisplayName} Safe Storage`,
+      "-a",
+      `${appDisplayName} Key`
+    ], { maxBuffer: 1024 * 1024 });
+    return { removed: true };
+  } catch {
+    return { removed: false };
+  }
+}
+
+async function runMacPortableLaunch(app, flags) {
+  const { profile, dictionary } = await loadProfile(rootDir, flags.profile);
+  const locale = resolveLocale(profile, flags);
+  const injectionSource = flags.noPreloadPatch
+    ? null
+    : buildInjectionSource({ profile, dictionary, launchLocale: locale, localeOverride: shouldOverrideLocale(profile, flags) });
+
+  if (!flags.noStop) {
+    logger.info("正在关闭旧的 Claude/ClaudeCNRuntime 进程，避免单实例冲突。");
+    await stopProcesses(["Claude"]);
+  }
+
+  logger.info("正在准备用户目录内的 macOS Claude ultra 运行时。首次运行会复制 Claude.app，可能需要几十秒。");
+  const runtime = await prepareMacPortableRuntime(rootDir, app, dictionary, { injectionSource, locale: profile.locale || "zh-CN" });
+  logger.info(`运行时身份：${runtime.identityStats?.appName || "Claude ultra"} (${runtime.identityStats?.bundleIdentifier || "unknown"})。`);
+  const sharedConfigRoot = await pathExists(path.join(macClaude3pRoot(), "claude_desktop_config.json"))
+    ? macClaude3pRoot()
+    : null;
+  if (sharedConfigRoot) {
+    const seededUserData = await seedMacPortableUserData(runtime.userDataDir);
+    logger.info(`Claude ultra 将通过符号链接共享原版 3P 配置：${sharedConfigRoot}`);
+    if (seededUserData.linked.length > 0) {
+      logger.info(`已链接共享配置/状态：${seededUserData.linked.join(", ")}。`);
+    }
+  } else {
+    logger.warn("未发现原版 Claude-3p 配置；按非侵入式规则，本次不会创建或复制配置文件。");
+  }
+
+  if (!flags.noModelSync) {
+    logger.info("已跳过模型同步写入，避免创建或修改配置文件。");
+  }
+
+  logger.info(`中文资源已写入：${runtime.localeStats.translated}/${runtime.localeStats.total} 条。`);
+  logger.info(`原生语言设置已加入中文：${runtime.nativeLanguageStats.patched} 个入口。`);
+  if (runtime.effortStats.patched > 0) {
+    logger.info(`Max 思考档位增强已写入：${runtime.effortStats.patched} 个入口（${runtime.effortStats.rules?.join(", ") || "legacy"}）。`);
+  } else {
+    logger.warn("Max 思考档位增强未命中当前 Claude 资源；请把 claude-cn-runtime.json 发给开发者排查。");
+  }
+  logger.info(`便携兼容增强已写入：${runtime.compatibilityStats.patched} 个入口。`);
+  logger.info(`主进程汉化注入已写入：${runtime.mainProcessStats.patched} 个入口。`);
+  logger.info(`预加载汉化脚本已写入：${runtime.preloadStats.patched} 个入口。`);
+
+  if (flags.dryRun) {
+    logger.info(`将启动：${runtime.runtimeExe}`);
+    logger.info(`工作目录：${runtime.runtimeDir}`);
+    logger.info(`用户数据目录：${runtime.userDataDir}`);
+    return;
+  }
+
+  await stopMacRuntimeApp(runtime.runtimeApp);
+
+  const browserStateCleanup = await cleanupMacPortableBrowserState(runtime.userDataDir);
+  if (browserStateCleanup.removed.length > 0) {
+    logger.info(`已清理 Claude ultra 浏览器状态，避免读取旧钥匙串项：${browserStateCleanup.removed.join(", ")}。`);
+  }
+  const keychainCleanup = await cleanupMacPortableKeychainItem();
+  if (keychainCleanup.removed) {
+    logger.info("已移除 Claude ultra 专用 Safe Storage 钥匙串项，将由当前运行时重新生成。");
+  }
+
+  const forceArm64 = await macSupportsArm64();
+  if (forceArm64 && process.arch !== "arm64") {
+    logger.info("检测到 Apple Silicon，已强制以 arm64 启动 Claude ultra 运行时。");
+  }
+  const processId = launchMacPortableRuntime(runtime, profile, { locale, forceArm64 });
+  logger.info(`已启动 macOS 便携 Claude 中文版：PID ${processId}`);
+  logger.info(`运行时目录：${runtime.runtimeDir}`);
+  logger.info(`用户数据目录：${runtime.userDataDir}`);
+}
+
 async function runModelSync(flags = {}) {
   try {
     const modelProbeLimit = flags.modelProbeLimit && flags.modelProbeLimit !== true
@@ -456,6 +785,7 @@ async function runModelSync(flags = {}) {
       ? Number(flags.gatewayTimeoutMs)
       : undefined;
     const result = await syncThirdPartyModels({
+      rootDir: flags.rootDir,
       includeNonChatModels: Boolean(flags.includeNonChatModels),
       probeModels: !flags.noModelProbe,
       modelProbeLimit,
@@ -525,6 +855,11 @@ async function runLaunch(flags) {
     return;
   }
 
+  if (app.kind === "mac" && !flags.experimentalCdp) {
+    await runMacPortableLaunch(app, flags);
+    return;
+  }
+
   const port = flags.port && flags.port !== true ? Number(flags.port) : await findAvailablePort();
   if (!Number.isInteger(port) || port <= 0) {
     throw new Error("端口无效。请使用 `--port 9229` 这样的正整数。");
@@ -533,9 +868,32 @@ async function runLaunch(flags) {
   const { profile, source } = await buildSource(flags);
 
   if (flags.dryRun) {
-    logger.info(`将启动：${app.executable}`);
-    logger.info(`参数：--remote-debugging-address=127.0.0.1 --remote-debugging-port=${port}`);
+    if (app.kind === "mac") {
+      logger.info(`将通过 macOS open 启动：${app.installLocation}`);
+    } else {
+      logger.info(`将启动：${app.executable}`);
+    }
+    logger.info(`参数：${buildRemoteDebuggingArgs(port, flags).join(" ")}`);
     return;
+  }
+
+  if (app.kind === "mac" && !flags.noModelSync) {
+    await runModelSync({
+      includeNonChatModels: flags.includeNonChatModels,
+      noModelProbe: flags.noModelProbe,
+      modelProbeLimit: flags.modelProbeLimit,
+      gatewayTimeoutMs: flags.gatewayTimeoutMs,
+      models: flags.models ?? flags.model,
+      gatewayBaseUrl: flags.gatewayBaseUrl,
+      gatewayApiKey: flags.gatewayApiKey,
+      gatewayAuthScheme: flags.gatewayAuthScheme,
+      inferenceProvider: flags.inferenceProvider
+    });
+  }
+
+  if (!flags.noStop && process.platform === "darwin") {
+    logger.info("正在关闭旧的 Claude 进程，避免单实例复用已有窗口。");
+    await stopProcesses(["Claude"]);
   }
 
   const alreadyRunning = await isClaudeRunning();
@@ -544,7 +902,11 @@ async function runLaunch(flags) {
   }
 
   await ensureDesktopShortcutForLaunch({ iconPath: app.executable }, flags);
-  launchClaude(app, port, flags);
+  if (app.kind === "mac") {
+    await launchMacClaude(app, port, flags);
+  } else {
+    launchClaude(app, port, flags);
+  }
   await waitForCdp(port);
   logger.info(`汉化层已就绪：${profile.name || profile.locale}`);
   logger.info("保持此终端开启，插件会持续注入新窗口。按 Ctrl+C 停止注入器；退出 Claude 会关闭调试端口。");
@@ -576,7 +938,11 @@ export async function main(argv) {
       return;
     case "doctor":
     case "self-test":
-      if (!flags.noStop && !flags.skipRuntime) {
+      if (!["win32", "darwin"].includes(process.platform) && !flags.skipRuntime) {
+        logger.info("当前平台暂不支持便携运行时自检，已自动跳过运行时检查。");
+        flags.skipRuntime = true;
+      }
+      if (process.platform === "win32" && !flags.noStop && !flags.skipRuntime) {
         logger.info("正在关闭旧的 Claude/ClaudeCNRuntime 进程，避免运行时文件锁。");
         await stopProcesses(["Claude", "ClaudeCNRuntime"]);
       }

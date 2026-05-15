@@ -236,6 +236,10 @@ function injectedRuntime(config) {
       return isEditableElement(element) || Boolean(selector && element.closest(selector));
     };
 
+    const shouldSkipElementAttributes = (element) => (
+      Boolean(element.closest("[data-claude-cn-skip],script,style,noscript,code,pre,kbd,samp"))
+    );
+
     const shouldSkipTextNode = (node) => {
       const parent = node.parentElement;
       if (!parent) {
@@ -244,9 +248,20 @@ function injectedRuntime(config) {
       return shouldSkipElement(parent);
     };
 
+    const shouldAdoptCurrentValue = (current, original) => {
+      const renderedOriginal = translate(original);
+      return current !== original && current !== renderedOriginal;
+    };
+
     const originalTextFor = (node) => {
+      const current = node.nodeValue;
       if (!state.originalText.has(node)) {
-        state.originalText.set(node, node.nodeValue);
+        state.originalText.set(node, current);
+      } else {
+        const original = state.originalText.get(node);
+        if (shouldAdoptCurrentValue(current, original)) {
+          state.originalText.set(node, current);
+        }
       }
       return state.originalText.get(node);
     };
@@ -263,27 +278,45 @@ function injectedRuntime(config) {
     };
 
     const originalAttributeFor = (element, attribute) => {
+      const current = element.getAttribute(attribute);
       let attributes = state.originalAttributes.get(element);
       if (!attributes) {
         attributes = new Map();
         state.originalAttributes.set(element, attributes);
       }
       if (!attributes.has(attribute)) {
-        attributes.set(attribute, element.getAttribute(attribute));
+        attributes.set(attribute, current);
+      } else {
+        const original = attributes.get(attribute);
+        if (shouldAdoptCurrentValue(current, original)) {
+          attributes.set(attribute, current);
+        }
       }
       return attributes.get(attribute);
     };
 
     const originalInputValueFor = (element) => {
+      const current = element.value;
       if (!state.originalInputValues.has(element)) {
-        state.originalInputValues.set(element, element.value);
+        state.originalInputValues.set(element, current);
+      } else {
+        const original = state.originalInputValues.get(element);
+        if (shouldAdoptCurrentValue(current, original)) {
+          state.originalInputValues.set(element, current);
+        }
       }
       return state.originalInputValues.get(element);
     };
 
     const originalElementTextFor = (element) => {
+      const current = element.textContent;
       if (!state.originalElementText.has(element)) {
-        state.originalElementText.set(element, element.textContent);
+        state.originalElementText.set(element, current);
+      } else {
+        const original = state.originalElementText.get(element);
+        if (shouldAdoptCurrentValue(current, original)) {
+          state.originalElementText.set(element, current);
+        }
       }
       return state.originalElementText.get(element);
     };
@@ -292,19 +325,22 @@ function injectedRuntime(config) {
       if (!(element instanceof Element)) {
         return;
       }
-      if (shouldSkipElement(element)) {
-        return;
+
+      if (!shouldSkipElementAttributes(element)) {
+        for (const attribute of state.config.translateAttributes || []) {
+          if (!element.hasAttribute(attribute)) {
+            continue;
+          }
+          const original = originalAttributeFor(element, attribute);
+          const next = state.enabled ? translate(original) : original;
+          if (next !== element.getAttribute(attribute)) {
+            element.setAttribute(attribute, next);
+          }
+        }
       }
 
-      for (const attribute of state.config.translateAttributes || []) {
-        if (!element.hasAttribute(attribute)) {
-          continue;
-        }
-        const original = originalAttributeFor(element, attribute);
-        const next = state.enabled ? translate(original) : original;
-        if (next !== element.getAttribute(attribute)) {
-          element.setAttribute(attribute, next);
-        }
+      if (shouldSkipElement(element)) {
+        return;
       }
 
       if (element instanceof HTMLInputElement && ["button", "submit", "reset"].includes(element.type)) {
@@ -362,7 +398,7 @@ function injectedRuntime(config) {
 
       const locale = normalizeLocale(state.currentLocale || readCurrentLocale());
       const chineseActive = isTargetLocale(locale);
-      const title = state.enabled ? "Claude Desktop Ultra" : "Claude Desktop Ultra";
+      const title = "Claude ultra";
       const label = state.enabled ? "界面语言" : "Interface language";
       const hint = state.enabled ? "这里是新增语言选项，英文资源仍保留。" : "Chinese is added as an extra locale; English stays intact.";
       card.replaceChildren();

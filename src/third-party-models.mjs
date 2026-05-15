@@ -1,5 +1,6 @@
 import fs from "node:fs/promises";
 import crypto from "node:crypto";
+import os from "node:os";
 import path from "node:path";
 
 async function pathExists(filePath) {
@@ -30,6 +31,10 @@ function timestamp() {
 }
 
 function claude3pRoot() {
+  if (process.platform === "darwin") {
+    return path.join(os.homedir(), "Library", "Application Support", "Claude-3p");
+  }
+
   const base = process.env.LOCALAPPDATA || process.env.APPDATA || process.cwd();
   return path.join(base, "Claude-3p");
 }
@@ -50,7 +55,7 @@ async function getAppliedConfigPath(rootDir = claude3pRoot()) {
 }
 
 async function ensureAppliedMeta(paths) {
-  const entryName = "Claude Desktop Ultra";
+  const entryName = "Claude ultra";
   const entries = Array.isArray(paths.meta?.entries)
     ? paths.meta.entries.filter((entry) => entry && isUuid(entry.id))
     : [];

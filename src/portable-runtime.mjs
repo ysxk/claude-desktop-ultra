@@ -11,9 +11,17 @@ const ASAR_JSON_OFFSET = 16;
 const ASAR_HEADER_SIZE_OFFSET = 4;
 const ASAR_STRING_SIZE_OFFSET = 12;
 const PRELOAD_PATCH_MARKER = "CLAUDE_CN_PRELOAD_PATCH";
-const MAIN_PROCESS_PATCH_MARKER = "CLAUDE_CN_MAIN_PROCESS_PATCH";
+const MAIN_PROCESS_PATCH_MARKER = "CLAUDE_CN_MAIN_PROCESS_PATCH_V7";
 const ULTRA_MAX_EFFORT_PATCH_MARKER = "CLAUDE_ULTRA_MAX_EFFORT_PATCH";
 const NATIVE_LANGUAGE_LIST_PATCH_MARKER = "CLAUDE_ULTRA_NATIVE_LANGUAGE_LIST_PATCH";
+const PORTABLE_COMPATIBILITY_PATCH_VERSION = 4;
+const MAC_RUNTIME_APP_NAME = "Claude ultra";
+const MAC_RUNTIME_BUNDLE_IDENTIFIER = "com.claudeultra.runtime";
+const MAC_RUNTIME_IDENTITY_VERSION = 2;
+const MAC_BUNDLE_TRANSIENT_FILES = [
+  "claude-cn-injection-status.json",
+  "claude-cn-injection-last.json"
+];
 
 async function pathExists(filePath) {
   try {
@@ -22,6 +30,40 @@ async function pathExists(filePath) {
   } catch {
     return false;
   }
+}
+
+async function readJsonIfExists(filePath) {
+  try {
+    const content = await fs.readFile(filePath, "utf8");
+    return JSON.parse(content.replace(/^\uFEFF/, ""));
+  } catch {
+    return null;
+  }
+}
+
+function reusePreviousStats(current, previous) {
+  if (!previous || current?.patched !== 0 || !previous.patched || previous.patched <= 0) {
+    return current;
+  }
+  return previous;
+}
+
+function isCompleteMacRuntimeStatus(status) {
+  return Boolean(
+    status?.localeStats?.translated > 0
+      && status?.nativeLanguageStats?.patched > 0
+      && status?.effortStats?.patched > 0
+      && status?.compatibilityStats?.patched > 0
+      && status?.compatibilityStats?.version === PORTABLE_COMPATIBILITY_PATCH_VERSION
+      && status?.mainProcessStats?.patched > 0
+      && status?.preloadStats?.patched > 0
+      && status?.identityStats?.version === MAC_RUNTIME_IDENTITY_VERSION
+      && status?.identityStats?.appName === MAC_RUNTIME_APP_NAME
+      && status?.identityStats?.bundleIdentifier === MAC_RUNTIME_BUNDLE_IDENTIFIER
+      && status?.asarIntegrityStats?.patched > 0
+      && status?.signingStats?.signed === true
+      && status?.mainProcessPatchMarker === MAIN_PROCESS_PATCH_MARKER
+  );
 }
 
 function sleep(ms) {
@@ -46,6 +88,241 @@ async function retryBusyFileOperation(operation, retries = 8) {
   throw lastError;
 }
 
+async function runCommand(command, args, options = {}) {
+  await execFileAsync(command, args, {
+    maxBuffer: 1024 * 1024,
+    ...options
+  });
+}
+
+async function removeMacQuarantine(appPath) {
+  if (process.platform !== "darwin") {
+    return;
+  }
+
+  try {
+    await runCommand("xattr", ["-dr", "com.apple.quarantine", appPath]);
+  } catch {
+    // Missing quarantine xattrs are harmless.
+  }
+}
+
+async function signMacApp(appPath) {
+  if (process.platform !== "darwin") {
+    return { signed: false };
+  }
+
+  await removeMacQuarantine(appPath);
+  await runCommand("codesign", ["--force", "--deep", "--sign", "-", appPath]);
+  return { signed: true, identity: "ad-hoc" };
+}
+
+async function removeMacBundleTransientFiles(appPath) {
+  if (process.platform !== "darwin") {
+    return { removed: 0, files: [] };
+  }
+
+  const contentsDir = path.join(appPath, "Contents");
+  const removedFiles = [];
+  for (const fileName of MAC_BUNDLE_TRANSIENT_FILES) {
+    const filePath = path.join(contentsDir, fileName);
+    if (!(await pathExists(filePath))) {
+      continue;
+    }
+
+    await fs.rm(filePath, { force: true });
+    removedFiles.push(filePath);
+  }
+
+  return { removed: removedFiles.length, files: removedFiles };
+}
+
+async function updateMacAsarIntegrity(runtimeApp) {
+  if (process.platform !== "darwin") {
+    return { patched: 0 };
+  }
+
+  const asarPath = path.join(runtimeApp, "Contents", "Resources", "app.asar");
+  if (!(await pathExists(asarPath))) {
+    return { patched: 0 };
+  }
+
+  const archive = await fs.readFile(asarPath);
+  const headerJsonSize = archive.readUInt32LE(ASAR_STRING_SIZE_OFFSET);
+  const nextHash = sha256(archive.slice(ASAR_JSON_OFFSET, ASAR_JSON_OFFSET + headerJsonSize));
+  const plistPaths = [];
+
+  async function walk(currentPath) {
+    let entries = [];
+    try {
+      entries = await fs.readdir(currentPath, { withFileTypes: true });
+    } catch {
+      return;
+    }
+
+    for (const entry of entries) {
+      const entryPath = path.join(currentPath, entry.name);
+      if (entry.isDirectory()) {
+        await walk(entryPath);
+      } else if (entry.isFile() && entry.name === "Info.plist") {
+        plistPaths.push(entryPath);
+      }
+    }
+  }
+
+  await walk(path.join(runtimeApp, "Contents"));
+
+  let patched = 0;
+  const integrityPattern = /(<key>ElectronAsarIntegrity<\/key>\s*<dict>\s*<key>Resources\/app\.asar<\/key>\s*<dict>\s*<key>algorithm<\/key>\s*<string>SHA256<\/string>\s*<key>hash<\/key>\s*<string>)([a-f0-9]{64})(<\/string>)/g;
+  for (const plistPath of plistPaths) {
+    const content = await fs.readFile(plistPath, "utf8");
+    const nextContent = content.replace(integrityPattern, `$1${nextHash}$3`);
+    if (nextContent === content) {
+      continue;
+    }
+    await fs.writeFile(plistPath, nextContent, "utf8");
+    patched += 1;
+  }
+
+  return { patched, hash: nextHash };
+}
+
+async function patchMacInfoPlist(runtimeApp) {
+  if (process.platform !== "darwin") {
+    return { patched: 0, appName: MAC_RUNTIME_APP_NAME, bundleIdentifier: MAC_RUNTIME_BUNDLE_IDENTIFIER };
+  }
+
+  const plistPath = path.join(runtimeApp, "Contents", "Info.plist");
+  if (!(await pathExists(plistPath))) {
+    return { patched: 0, appName: MAC_RUNTIME_APP_NAME, bundleIdentifier: MAC_RUNTIME_BUNDLE_IDENTIFIER };
+  }
+
+  const replacements = {
+    CFBundleIdentifier: MAC_RUNTIME_BUNDLE_IDENTIFIER,
+    CFBundleName: MAC_RUNTIME_APP_NAME,
+    CFBundleDisplayName: MAC_RUNTIME_APP_NAME
+  };
+  let content = await fs.readFile(plistPath, "utf8");
+  let patched = 0;
+  for (const [key, value] of Object.entries(replacements)) {
+    const pattern = new RegExp(`(<key>${key}<\\/key>\\s*<string>)([^<]*)(<\\/string>)`);
+    content = content.replace(pattern, (match, prefix, previous, suffix) => {
+      if (previous === value) {
+        return match;
+      }
+      patched += 1;
+      return `${prefix}${value}${suffix}`;
+    });
+  }
+  if (patched > 0) {
+    await fs.writeFile(plistPath, content, "utf8");
+  }
+  return { patched, appName: MAC_RUNTIME_APP_NAME, bundleIdentifier: MAC_RUNTIME_BUNDLE_IDENTIFIER };
+}
+
+async function patchPlistStringValues(plistPath, replacements) {
+  if (!(await pathExists(plistPath))) {
+    return 0;
+  }
+
+  let content = await fs.readFile(plistPath, "utf8");
+  let patched = 0;
+  for (const [key, value] of Object.entries(replacements)) {
+    const pattern = new RegExp(`(<key>${key}<\\/key>\\s*<string>)([^<]*)(<\\/string>)`);
+    content = content.replace(pattern, (match, prefix, previous, suffix) => {
+      if (previous === value) {
+        return match;
+      }
+      patched += 1;
+      return `${prefix}${value}${suffix}`;
+    });
+  }
+  if (patched > 0) {
+    await fs.writeFile(plistPath, content, "utf8");
+  }
+  return patched;
+}
+
+async function patchMacHelperApps(runtimeApp) {
+  const frameworksDir = path.join(runtimeApp, "Contents", "Frameworks");
+  const helpers = [
+    { suffix: "", identifier: `${MAC_RUNTIME_BUNDLE_IDENTIFIER}.helper` },
+    { suffix: " (Renderer)", identifier: `${MAC_RUNTIME_BUNDLE_IDENTIFIER}.helper.renderer` },
+    { suffix: " (GPU)", identifier: `${MAC_RUNTIME_BUNDLE_IDENTIFIER}.helper.gpu` },
+    { suffix: " (Plugin)", identifier: `${MAC_RUNTIME_BUNDLE_IDENTIFIER}.helper.plugin` }
+  ];
+  let renamedApps = 0;
+  let renamedExecutables = 0;
+  let plistPatched = 0;
+
+  for (const helper of helpers) {
+    const oldBaseName = `Claude Helper${helper.suffix}`;
+    const newBaseName = `${MAC_RUNTIME_APP_NAME} Helper${helper.suffix}`;
+    const oldApp = path.join(frameworksDir, `${oldBaseName}.app`);
+    const newApp = path.join(frameworksDir, `${newBaseName}.app`);
+
+    if ((await pathExists(oldApp)) && !(await pathExists(newApp))) {
+      await fs.rename(oldApp, newApp);
+      renamedApps += 1;
+    }
+
+    const helperApp = (await pathExists(newApp)) ? newApp : oldApp;
+    if (!(await pathExists(helperApp))) {
+      continue;
+    }
+
+    const macosDir = path.join(helperApp, "Contents", "MacOS");
+    const oldExe = path.join(macosDir, oldBaseName);
+    const newExe = path.join(macosDir, newBaseName);
+    if ((await pathExists(oldExe)) && !(await pathExists(newExe))) {
+      await fs.rename(oldExe, newExe);
+      renamedExecutables += 1;
+    }
+
+    plistPatched += await patchPlistStringValues(path.join(helperApp, "Contents", "Info.plist"), {
+      CFBundleExecutable: newBaseName,
+      CFBundleName: newBaseName,
+      CFBundleDisplayName: newBaseName,
+      CFBundleIdentifier: helper.identifier
+    });
+  }
+
+  return { renamedApps, renamedExecutables, plistPatched };
+}
+
+async function patchMacPackageMetadata(resourcesDir) {
+  const asarPath = path.join(resourcesDir, "app.asar");
+  if (!(await pathExists(asarPath))) {
+    return { patched: 0 };
+  }
+
+  return patchAsarFile(asarPath, [
+    {
+      file: "package.json",
+      transform: (content) => {
+        const manifest = JSON.parse(content);
+        manifest.name = "claude-ultra";
+        manifest.productName = MAC_RUNTIME_APP_NAME;
+        return `${JSON.stringify(manifest, null, 2)}\n`;
+      }
+    }
+  ]);
+}
+
+async function patchMacRuntimeIdentity(runtimeApp, resourcesDir) {
+  const plistStats = await patchMacInfoPlist(runtimeApp);
+  const helperStats = await patchMacHelperApps(runtimeApp);
+  const packageStats = await patchMacPackageMetadata(resourcesDir);
+  return {
+    version: MAC_RUNTIME_IDENTITY_VERSION,
+    appName: MAC_RUNTIME_APP_NAME,
+    bundleIdentifier: MAC_RUNTIME_BUNDLE_IDENTIFIER,
+    plistPatched: plistStats.patched,
+    helperStats,
+    packagePatched: packageStats.patched
+  };
+}
+
 async function expandZip(zipPath, destination) {
   const script = `
 $ErrorActionPreference = "Stop"
@@ -58,9 +335,17 @@ Expand-Archive -LiteralPath ${JSON.stringify(zipPath)} -DestinationPath ${JSON.s
 }
 
 function runtimeRootFor(app) {
-  const base = process.env.LOCALAPPDATA || process.env.TEMP || process.cwd();
+  const base = process.platform === "darwin"
+    ? path.join(process.env.HOME || process.cwd(), "Library", "Application Support")
+    : (process.env.LOCALAPPDATA || process.env.TEMP || process.cwd());
   const safeVersion = String(app.version || "unknown").replace(/[^\w.-]+/g, "_");
   return path.join(base, "ClaudeCNOverlay", "runtime", `${safeVersion}-electron-${ELECTRON_VERSION}`);
+}
+
+function macRuntimeRootFor(app) {
+  const base = path.join(process.env.HOME || process.cwd(), "Library", "Application Support");
+  const safeVersion = String(app.version || "unknown").replace(/[^\w.-]+/g, "_");
+  return path.join(base, "ClaudeCNOverlay", "runtime", `${safeVersion}-mac`);
 }
 
 async function findRuntimeZip(rootDir) {
@@ -449,12 +734,25 @@ function buildMainProcessPatch(injectionSource) {
 try {
   const { app } = require("electron");
   const fs = require("node:fs");
+  const os = require("node:os");
   const path = require("node:path");
   const source = ${JSON.stringify(evaluatedSource)};
-  const statusPath = path.resolve(process.resourcesPath, "..", "claude-cn-injection-status.json");
-  const lastStatusPath = path.resolve(process.resourcesPath, "..", "claude-cn-injection-last.json");
+  const defaultStatusDir = (() => {
+    try {
+      return path.join(app.getPath("userData"), "ClaudeCNOverlay");
+    } catch {
+      const base = process.platform === "darwin"
+        ? path.join(os.homedir(), "Library", "Application Support")
+        : path.join(os.homedir(), ".claude-cn-overlay");
+      return path.join(base, "ClaudeCNOverlay");
+    }
+  })();
+  const statusDir = process.env.CLAUDE_CN_STATUS_DIR || defaultStatusDir;
+  const statusPath = path.join(statusDir, "claude-cn-injection-status.json");
+  const lastStatusPath = path.join(statusDir, "claude-cn-injection-last.json");
   const writeStatus = (status) => {
     try {
+      fs.mkdirSync(statusDir, { recursive: true });
       const payload = { at: new Date().toISOString(), ...status };
       fs.writeFileSync(lastStatusPath, JSON.stringify(payload, null, 2));
       if (payload.result && (payload.result.hasOverlay || payload.result.zhCount > 0 || payload.result.textSample)) {
@@ -597,19 +895,59 @@ function patchCoworkMsixCheck(content) {
   return nextContent;
 }
 
+function patchMacVirtualizationEntitlementCheck(content) {
+  const entitlementPattern = /if\((\w+)==="entitlement_missing"\)return\{status:"unsupported",reason:[^;]+?unsupportedCode:"virtualization_entitlement_missing"\};/g;
+  return content.replace(
+    entitlementPattern,
+    (_match, resultName) => `if(${resultName}==="entitlement_missing")return{status:"supported"};`
+  );
+}
+
+function patchMacSharedConfigWrites(content) {
+  const configWritePattern = /function u8\((\w+)\)\{return qJe\.runExclusive\(async\(\)=>\{const (\w+)=sF\(\);try\{await _r\(\2,\1\),S\.info\("Config file written"\)\}catch\((\w+)\)\{S\.error\("Error reading or parsing config file: %o",\3\);return\}\}\)\}/;
+  return content.replace(
+    configWritePattern,
+    (_match, configName) => `function u8(${configName}){return qJe.runExclusive(async()=>{S.info("Shared config is read-only; skipped config write")})}`
+  );
+}
+
+function patchMacDesktopUserAgent(content) {
+  const userAgentPattern = /(vI\(\)&&\((\w+)\.app\.userAgentFallback=`\$\{\2\.app\.userAgentFallback\} MSIX`\);)(xfr\(\);)/;
+  return content.replace(
+    userAgentPattern,
+    (_match, prefix, electronName, suffix) => `${prefix}${electronName}.app.userAgentFallback+=\` Claude/\${${electronName}.app.getVersion()}\`;${suffix}`
+  );
+}
+
 async function patchPortableCompatibility(resourcesDir) {
   const asarPath = path.join(resourcesDir, "app.asar");
   if (!(await pathExists(asarPath))) {
     return { patched: 0 };
   }
 
-  return patchAsarFile(asarPath, [
+  const result = await patchAsarFile(asarPath, [
     {
       file: ".vite/build/index.js",
-      transform: (content) => patchCoworkMsixCheck(patchGatewayHealthModelSelector(content)),
+      transform: (content) => patchMacDesktopUserAgent(patchMacSharedConfigWrites(patchMacVirtualizationEntitlementCheck(patchCoworkMsixCheck(patchGatewayHealthModelSelector(content))))),
+      inPlace: true
+    },
+    {
+      file: ".vite/build/index.pre.js",
+      transform: patchMacVirtualizationEntitlementCheck,
+      inPlace: true
+    },
+    {
+      file: ".vite/build/mainView.js",
+      transform: patchMacVirtualizationEntitlementCheck,
+      inPlace: true
+    },
+    {
+      file: ".vite/build/mainWindow.js",
+      transform: patchMacVirtualizationEntitlementCheck,
       inPlace: true
     }
   ]);
+  return { ...result, version: PORTABLE_COMPATIBILITY_PATCH_VERSION };
 }
 
 async function findJavaScriptFiles(rootPath) {
@@ -885,5 +1223,117 @@ export async function preparePortableRuntime(rootDir, app, dictionary, options =
     compatibilityStats,
     mainProcessStats,
     preloadStats
+  };
+}
+
+export async function prepareMacPortableRuntime(rootDir, app, dictionary, options = {}) {
+  if (process.platform !== "darwin") {
+    throw new Error("macOS 便携运行时只能在 macOS 上准备。");
+  }
+  if (!app?.installLocation || !app.installLocation.endsWith(".app")) {
+    throw new Error("缺少 Claude.app 路径，无法准备 macOS 便携运行时。");
+  }
+
+  const runtimeDir = macRuntimeRootFor(app);
+  const runtimeApp = path.join(runtimeDir, `${MAC_RUNTIME_APP_NAME}.app`);
+  const runtimeExe = path.join(runtimeApp, "Contents", "MacOS", "Claude");
+  const resourcesDir = path.join(runtimeApp, "Contents", "Resources");
+  const userDataDir = path.join(runtimeDir, "user-data");
+  const statusPath = path.join(runtimeDir, "claude-cn-runtime.json");
+  const previousStatus = await readJsonIfExists(statusPath);
+
+  if ((await pathExists(runtimeExe)) && isCompleteMacRuntimeStatus(previousStatus)) {
+    const transientCleanupStats = await removeMacBundleTransientFiles(runtimeApp);
+    const signingStats = transientCleanupStats.removed > 0
+      ? await signMacApp(runtimeApp)
+      : previousStatus.signingStats || { signed: false };
+    return {
+      runtimeDir,
+      runtimeApp,
+      runtimeExe,
+      resourcesDir,
+      userDataDir,
+      iconStats: { patched: 0, iconPath: path.join(resourcesDir, "electron.icns") },
+      localeStats: previousStatus.localeStats || { patched: 0, translated: 0, total: 0 },
+      effortStats: previousStatus.effortStats || { patched: 0, rules: [] },
+      nativeLanguageStats: previousStatus.nativeLanguageStats || { patched: 0 },
+      compatibilityStats: previousStatus.compatibilityStats || { patched: 0 },
+      mainProcessStats: previousStatus.mainProcessStats || { patched: 0 },
+      preloadStats: previousStatus.preloadStats || { patched: 0 },
+      identityStats: previousStatus.identityStats || {
+        version: MAC_RUNTIME_IDENTITY_VERSION,
+        appName: MAC_RUNTIME_APP_NAME,
+        bundleIdentifier: MAC_RUNTIME_BUNDLE_IDENTIFIER
+      },
+      asarIntegrityStats: previousStatus.asarIntegrityStats || { patched: 0 },
+      signingStats,
+      transientCleanupStats
+    };
+  }
+
+  if (!(await pathExists(runtimeExe)) || !isCompleteMacRuntimeStatus(previousStatus)) {
+    await fs.rm(runtimeDir, { recursive: true, force: true });
+    await fs.mkdir(runtimeDir, { recursive: true });
+    await retryBusyFileOperation(() => fs.cp(app.installLocation, runtimeApp, {
+      recursive: true,
+      force: true,
+      verbatimSymlinks: true
+    }));
+  }
+
+  const localeStats = await patchLocale(resourcesDir, app, dictionary, options.locale || "zh-CN");
+  const effortStats = reusePreviousStats(await patchMaxEffortSupport(resourcesDir), previousStatus?.effortStats);
+  const nativeLanguageStats = reusePreviousStats(await patchNativeLanguageList(resourcesDir, options.locale || "zh-CN"), previousStatus?.nativeLanguageStats);
+  const compatibilityStats = reusePreviousStats(await patchPortableCompatibility(resourcesDir), previousStatus?.compatibilityStats);
+  const mainProcessStats = reusePreviousStats(await patchMainProcess(resourcesDir, options.injectionSource), previousStatus?.mainProcessStats);
+  const preloadStats = reusePreviousStats(await patchPreloadScripts(resourcesDir, options.injectionSource), previousStatus?.preloadStats);
+  const identityStats = await patchMacRuntimeIdentity(runtimeApp, resourcesDir);
+  const transientCleanupStats = await removeMacBundleTransientFiles(runtimeApp);
+  const asarIntegrityStats = await updateMacAsarIntegrity(runtimeApp);
+  const signingStats = await signMacApp(runtimeApp);
+
+  await fs.writeFile(
+    statusPath,
+    `${JSON.stringify(
+      {
+        sourcePackage: app.packageFullName,
+        sourceVersion: app.version,
+        platform: "darwin",
+        runtimeApp,
+        mainProcessPatchMarker: MAIN_PROCESS_PATCH_MARKER,
+        localeStats,
+        effortStats,
+        nativeLanguageStats,
+        compatibilityStats,
+        mainProcessStats,
+        preloadStats,
+        identityStats,
+        transientCleanupStats,
+        asarIntegrityStats,
+        signingStats
+      },
+      null,
+      2
+    )}\n`,
+    "utf8"
+  );
+
+  return {
+    runtimeDir,
+    runtimeApp,
+    runtimeExe,
+    resourcesDir,
+    userDataDir,
+    iconStats: { patched: 0, iconPath: path.join(resourcesDir, "electron.icns") },
+    localeStats,
+    effortStats,
+    nativeLanguageStats,
+    compatibilityStats,
+    mainProcessStats,
+    preloadStats,
+    identityStats,
+    transientCleanupStats,
+    asarIntegrityStats,
+    signingStats
   };
 }

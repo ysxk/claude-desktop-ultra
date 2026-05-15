@@ -1,15 +1,18 @@
+import { execFile } from "node:child_process";
 import fs from "node:fs/promises";
 import http from "node:http";
 import os from "node:os";
 import path from "node:path";
+import { promisify } from "node:util";
 
 import { detectClaude } from "./adapters/claude-desktop.mjs";
 import { buildInjectionSource } from "./injection-source.mjs";
 import { loadProfile } from "./locale.mjs";
-import { applyMaxEffortPatchRules, preparePortableRuntime } from "./portable-runtime.mjs";
+import { applyMaxEffortPatchRules, prepareMacPortableRuntime, preparePortableRuntime } from "./portable-runtime.mjs";
 import { syncThirdPartyModels } from "./third-party-models.mjs";
 
 const TEST_MODEL = "deepseek-v4-flash";
+const execFileAsync = promisify(execFile);
 
 async function pathExists(filePath) {
   try {
@@ -81,6 +84,24 @@ async function findModelMenuSectionReversalLeaks(resourcesDir) {
   }
 
   return leaks;
+}
+
+async function verifyMacCodeSignature(appPath) {
+  if (process.platform !== "darwin") {
+    return { ok: false, detail: "not-macos" };
+  }
+
+  try {
+    await execFileAsync("codesign", ["--verify", "--deep", "--strict", "--verbose=2", appPath], {
+      maxBuffer: 1024 * 1024
+    });
+    return { ok: true, detail: appPath };
+  } catch (error) {
+    return {
+      ok: false,
+      detail: error.stderr?.trim() || error.stdout?.trim() || error.message
+    };
+  }
 }
 
 async function startFakeGateway() {
@@ -277,6 +298,11 @@ function testInjectionSkipsEditableText(recorder) {
     source.includes("isEditableElement")
       && source.includes("[contenteditable]:not([contenteditable=\"false\"]),[role=\"textbox\"]")
   );
+  recorder.check(
+    "汉化注入会采纳 React 动态更新文本",
+    source.includes("shouldAdoptCurrentValue")
+      && source.includes("current !== original && current !== renderedOriginal")
+  );
 }
 
 function testMaxEffortPatchKeepsModelMenuPrimary(recorder) {
@@ -305,7 +331,13 @@ async function testPortableRuntime(recorder, rootDir, flags = {}) {
     launchLocale: locale,
     localeOverride: Boolean(flags.locale || flags.lang || profile.localeOverride)
   });
-  const runtime = await preparePortableRuntime(rootDir, app, dictionary, {
+  const isMacRuntime = app.kind === "mac";
+  const runtime = isMacRuntime
+    ? await prepareMacPortableRuntime(rootDir, app, dictionary, {
+      injectionSource,
+      locale
+    })
+    : await preparePortableRuntime(rootDir, app, dictionary, {
     injectionSource,
     locale
   });
@@ -315,7 +347,7 @@ async function testPortableRuntime(recorder, rootDir, flags = {}) {
   const zhLocaleContent = await fs.readFile(zhLocalePath, "utf8");
   const runtimeStatus = await readJson(runtimeStatusPath);
 
-  recorder.check("便携运行时 exe 可用", await pathExists(runtime.runtimeExe), runtime.runtimeExe);
+  recorder.check(isMacRuntime ? "macOS 便携运行时可执行文件可用" : "便携运行时 exe 可用", await pathExists(runtime.runtimeExe), runtime.runtimeExe);
   recorder.check("中文 locale 已写入", /[\u4e00-\u9fff]/.test(zhLocaleContent), zhLocalePath);
   recorder.check("英文 locale 保留", await pathExists(enLocalePath), enLocalePath);
   recorder.check("语言设置包含 zh-CN 入口", runtime.nativeLanguageStats.patched > 0);
@@ -328,14 +360,34 @@ async function testPortableRuntime(recorder, rootDir, flags = {}) {
   recorder.check("主进程汉化注入已写入", runtime.mainProcessStats.patched > 0);
   recorder.check("preload 汉化注入已写入", runtime.preloadStats.patched > 0);
   recorder.check("便携兼容补丁已写入", runtime.compatibilityStats.patched > 0);
+
+  if (isMacRuntime) {
+    const staleStatusFiles = [
+      path.join(runtime.runtimeApp, "Contents", "claude-cn-injection-status.json"),
+      path.join(runtime.runtimeApp, "Contents", "claude-cn-injection-last.json")
+    ];
+    const staleStatusExists = (await Promise.all(staleStatusFiles.map(pathExists))).some(Boolean);
+    const macSignature = await verifyMacCodeSignature(runtime.runtimeApp);
+    recorder.check("macOS 注入状态不会污染 .app 包", !staleStatusExists, staleStatusFiles.join(", "));
+    recorder.check("macOS app.asar 完整性已更新", Boolean(runtime.asarIntegrityStats?.hash), runtime.asarIntegrityStats?.hash || "");
+    recorder.check("macOS app 已重新签名", runtime.signingStats?.signed === true, runtime.signingStats?.identity || "");
+    recorder.check("macOS codesign 校验通过", macSignature.ok, macSignature.detail);
+  }
 }
 
 export async function runWindowsSelfTest({ rootDir, flags = {}, logger = console } = {}) {
   const recorder = createRecorder(logger);
   const gateway = await startFakeGateway();
+  const testName = flags.skipRuntime
+    ? "基础自检"
+    : process.platform === "darwin"
+      ? "macOS 自检"
+      : process.platform === "win32"
+        ? "Windows 自检"
+        : "自检";
 
   try {
-    logger.info(`Windows 自检开始，测试模型：${TEST_MODEL}`);
+    logger.info(`${testName}开始，测试模型：${TEST_MODEL}`);
     testInjectionSkipsEditableText(recorder);
     testMaxEffortPatchKeepsModelMenuPrimary(recorder);
     await testEmptyConfigDoesNotActivate(recorder);
@@ -350,10 +402,10 @@ export async function runWindowsSelfTest({ rootDir, flags = {}, logger = console
 
   if (recorder.failed.length > 0) {
     const failedNames = recorder.failed.map((result) => result.name).join("；");
-    throw new Error(`Windows 自检未通过：${failedNames}`);
+    throw new Error(`${testName}未通过：${failedNames}`);
   }
 
-  logger.info("Windows 自检全部通过。");
+  logger.info(`${testName}全部通过。`);
   return {
     ok: true,
     model: TEST_MODEL,
