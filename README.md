@@ -99,3 +99,4 @@ Claude Desktop Ultra 不改写 WindowsApps 内的 Claude 安装目录。增强�
 ## TODO
 
 - Sub Agent 激活：解锁 / 接入 Claude Desktop 内部的 Sub Agent 能力，让增强器可以显示并启用更多 agent 编排入口。
+- 自定义 1m 上下文解锁：允许用户配置并启用更长上下文窗口。
