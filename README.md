@@ -30,6 +30,14 @@ Claude Desktop Ultra 是一个 Claude Desktop 增强器。它通过非侵入式�
 .\dist\ClaudeCN.exe launch
 ```
 
+## 交流群
+
+- QQ 群：`AI技术交流`
+- 群号：`837772867`
+- 欢迎交流 Claude Desktop Ultra、Claude Desktop 增强、第三方模型接入和本地 AI 工具玩法。
+
+![QQ 群二维码](docs/qrcode_1778832525816.jpg)
+
 ## 常用命令
 
 ```powershell
