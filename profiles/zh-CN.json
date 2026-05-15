@@ -24,7 +24,8 @@
     "samp",
     "textarea",
     "input",
-    "[contenteditable=\"true\"]",
+    "[contenteditable]:not([contenteditable=\"false\"])",
+    "[role=\"textbox\"]",
     "[data-claude-cn-skip]"
   ],
   "pollIntervalMs": 1200

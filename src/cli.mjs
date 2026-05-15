@@ -8,6 +8,7 @@ import { findAvailablePort, waitForCdp, watchAndInject } from "./cdp.mjs";
 import { buildInjectionSource } from "./injection-source.mjs";
 import { auditLocale, loadProfile, readEnglishLocale, writeMissingTemplate } from "./locale.mjs";
 import { preparePortableRuntime } from "./portable-runtime.mjs";
+import { runWindowsSelfTest } from "./self-test.mjs";
 import { syncThirdPartyModels } from "./third-party-models.mjs";
 
 const rootDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -54,10 +55,11 @@ function parseArgs(argv) {
 
 function printHelp() {
   console.log(`
-Claude Desktop 简体中文非侵入式汉化启动器
+Claude Desktop Ultra - Claude Desktop 增强器
 
 用法：
   node ./bin/claude-cn.mjs detect
+  node ./bin/claude-cn.mjs doctor [--skip-runtime]
   node ./bin/claude-cn.mjs audit [--write-template]
   node ./bin/claude-cn.mjs models [--include-non-chat-models] [--no-model-probe]
   node ./bin/claude-cn.mjs models --gateway-base-url <url> --gateway-api-key <key> --models <model1,model2>
@@ -68,6 +70,7 @@ Claude Desktop 简体中文非侵入式汉化启动器
   - Microsoft Store/MSIX 版会在用户目录创建便携运行时，复制 Claude 资源并覆盖 locale，不修改 WindowsApps。
   - classic 安装版仍使用 127.0.0.1 DevTools 端口注入 DOM 汉化层。
   - 第三方 Gateway 会优先探测可用模型并放到模型列表第一位，避免健康检查误选无权限模型。
+  - doctor 会用 deepseek-v4-flash 自检汉化、模型解锁、Max 思考值和旧版配置迁移。
 `);
 }
 
@@ -493,7 +496,9 @@ async function runModelSync(flags = {}) {
       logger.info(`配置文件：${result.configPath}`);
       logger.info(`配置索引：${result.metaPath}`);
       logger.info(`旧版默认配置：${result.legacyConfigPath}`);
-      logger.info(`第三方推理模式文件：${result.deploymentMode?.path}`);
+      if (result.deploymentMode?.path) {
+        logger.info(`第三方推理模式文件：${result.deploymentMode.path}`);
+      }
       if (!result.configExists) {
         logger.warn("未发现 Claude-3p 配置文件；需要先在开发者模式里配置第三方推理，或用命令写入。");
       }
@@ -568,6 +573,14 @@ export async function main(argv) {
   switch (command) {
     case "detect":
       await runDetect();
+      return;
+    case "doctor":
+    case "self-test":
+      if (!flags.noStop && !flags.skipRuntime) {
+        logger.info("正在关闭旧的 Claude/ClaudeCNRuntime 进程，避免运行时文件锁。");
+        await stopProcesses(["Claude", "ClaudeCNRuntime"]);
+      }
+      await runWindowsSelfTest({ rootDir, flags, logger });
       return;
     case "audit":
       await runAudit(flags);

@@ -20,6 +20,7 @@ Claude Desktop Ultra 是一个 Claude Desktop 增强器。它通过非侵入式�
 - 彩色应用图标：启动的 `ClaudeCNRuntime.exe` 会写入 Claude 官方彩色图标，避免任务栏显示空白或黑色托盘图标。
 - 自动桌面快捷方式：首次正常启动后会在 Windows 桌面创建 `Claude Desktop Ultra.lnk`，后续启动只复用 / 更新，不重复创建。
 - 运行时状态记录：每次准备运行时都会写入 `claude-cn-runtime.json`，记录图标、语言、Max 档位、主进程注入和 preload 注入是否成功。
+- Windows 自检：内置 `doctor` 命令，会用 `deepseek-v4-flash` 模拟 Gateway，验证汉化运行时、模型解锁、Max 思考值和旧版配置迁移。
 
 ## 使用方法
 
@@ -47,6 +48,7 @@ Claude Desktop Ultra 是一个 Claude Desktop 增强器。它通过非侵入式�
 
 ```powershell
 npm run detect
+npm run doctor
 npm run audit
 npm run launch
 npm run build:exe
@@ -56,6 +58,7 @@ npm run build:exe
 
 ```powershell
 .\dist\ClaudeCN.exe detect
+.\dist\ClaudeCN.exe doctor
 .\dist\ClaudeCN.exe launch
 .\dist\ClaudeCN.exe launch --dry-run
 .\dist\ClaudeCN.exe models
@@ -96,7 +99,7 @@ npm run build:exe
 如果目标电脑还没有配置，可以用命令写入基础配置：
 
 ```powershell
-.\dist\ClaudeCN.exe models --gateway-base-url "https://你的网关地址" --gateway-api-key "你的 API Key" --models "gpt-4o,gemini-2.5-pro,deepseek-chat"
+.\dist\ClaudeCN.exe models --gateway-base-url "https://你的网关地址" --gateway-api-key "你的 API Key" --models "deepseek-v4-flash,gpt-4o,gemini-2.5-pro"
 ```
 
 也可以用环境变量，避免把 Key 放在命令行历史里：
@@ -104,13 +107,14 @@ npm run build:exe
 ```powershell
 $env:CLAUDE_ULTRA_GATEWAY_BASE_URL="https://你的网关地址"
 $env:CLAUDE_ULTRA_GATEWAY_API_KEY="你的 API Key"
-$env:CLAUDE_ULTRA_MODELS="gpt-4o,gemini-2.5-pro,deepseek-chat"
+$env:CLAUDE_ULTRA_MODELS="deepseek-v4-flash,gpt-4o,gemini-2.5-pro"
 .\dist\ClaudeCN.exe models
 ```
 
 ## 常见问题
 
-- 别的电脑没有解锁模型：通常是那台电脑没有 Claude-3p Gateway 配置、`configLibrary/_meta.json` 缺失，或 `/v1/models` 读取失败。先运行 `.\dist\ClaudeCN.exe models --gateway-base-url "网关地址" --gateway-api-key "Key" --models "gpt-4o"`，新版会自动修复配置索引并切到 3P 模式。
+- 别的电脑没有解锁模型：通常是那台电脑没有 Claude-3p Gateway 配置、`configLibrary/_meta.json` 缺失，或 `/v1/models` 读取失败。先运行 `.\dist\ClaudeCN.exe models --gateway-base-url "网关地址" --gateway-api-key "Key" --models "deepseek-v4-flash"`，新版会自动修复配置索引并切到 3P 模式。
+- 不确定目标电脑是否可用：运行 `.\dist\ClaudeCN.exe doctor`，自检会用 `deepseek-v4-flash` 验证空白机器、旧版迁移、汉化运行时和 Max 思考值补丁。
 - 别的电脑没有 `Max` 思考值：请运行新版 exe，启动日志里应出现 `Max 思考档位增强已写入`，同时 `claude-cn-runtime.json` 里的 `effortStats.rules` 不应为空。
 - 别的电脑提示 `Gateway returned an error`：通常是网关健康检查选到了该账号无权限 / 无额度的模型。新版会优先选择可用第三方模型；仍失败时，打开“开发者模式 → 配置第三方推理”，把模型列表第一项改成网关实际能调用的模型。
 - 别的电脑提示 `Reinstall required`：这是 Claude 对便携运行时的安装来源检测。Ultra 已绕过 MSIX 来源误判；如果仍提示，请确认目标电脑安装的是 Microsoft Store / MSIX 版 Claude Desktop，并重新运行新版 exe。

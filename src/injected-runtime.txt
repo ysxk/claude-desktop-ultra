@@ -212,13 +212,36 @@ function injectedRuntime(config) {
 
     const skipSelector = () => state.config.skipTextSelectors?.join(",") || "";
 
+    const isEditableElement = (element) => {
+      if (!(element instanceof Element)) {
+        return false;
+      }
+      if (element instanceof HTMLTextAreaElement) {
+        return true;
+      }
+      if (element instanceof HTMLInputElement) {
+        return !["button", "submit", "reset", "checkbox", "radio", "file", "image", "color", "range"].includes(element.type);
+      }
+      if (element.isContentEditable) {
+        return true;
+      }
+      if (element.closest('[contenteditable]:not([contenteditable="false"]),[role="textbox"]')) {
+        return true;
+      }
+      return false;
+    };
+
+    const shouldSkipElement = (element) => {
+      const selector = skipSelector();
+      return isEditableElement(element) || Boolean(selector && element.closest(selector));
+    };
+
     const shouldSkipTextNode = (node) => {
       const parent = node.parentElement;
       if (!parent) {
         return true;
       }
-      const selector = skipSelector();
-      return Boolean(selector && parent.closest(selector));
+      return shouldSkipElement(parent);
     };
 
     const originalTextFor = (node) => {
@@ -267,6 +290,9 @@ function injectedRuntime(config) {
 
     const processElement = (element) => {
       if (!(element instanceof Element)) {
+        return;
+      }
+      if (shouldSkipElement(element)) {
         return;
       }
 

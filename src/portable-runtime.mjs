@@ -195,12 +195,24 @@ try {
 }
 `;
 
-  await execFileAsync("powershell.exe", ["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script], {
-    windowsHide: true,
-    maxBuffer: 1024 * 1024
-  });
+  let lastError = null;
+  for (let attempt = 0; attempt <= 5; attempt += 1) {
+    try {
+      await execFileAsync("powershell.exe", ["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script], {
+        windowsHide: true,
+        maxBuffer: 1024 * 1024
+      });
+      return { patched: 1, iconPath };
+    } catch (error) {
+      lastError = error;
+      if (attempt === 5) {
+        throw error;
+      }
+      await sleep(300 * (attempt + 1));
+    }
+  }
 
-  return { patched: 1, iconPath };
+  throw lastError;
 }
 
 async function convertPngToIco(pngPath, icoPath) {
@@ -627,26 +639,37 @@ async function findJavaScriptFiles(rootPath) {
 
 function replaceWithCount(content, pattern, replacement) {
   let count = 0;
-  const nextContent = content.replace(pattern, (...args) => {
-    count += 1;
-    return typeof replacement === "function" ? replacement(...args) : replacement;
-  });
+  const nextContent = typeof replacement === "function"
+    ? content.replace(pattern, (...args) => {
+      count += 1;
+      return replacement(...args);
+    })
+    : content.replace(pattern, (...args) => {
+      count += 1;
+      const captures = args.slice(1, -2);
+      return replacement.replace(/\$(\d+)/g, (match, indexText) => {
+        const capture = captures[Number(indexText) - 1];
+        return capture === undefined ? match : capture;
+      });
+    });
 
   return { content: nextContent, count };
 }
 
-function applyMaxEffortPatchRules(content) {
+function assertNoMaxEffortReplacementLeaks(content, filePath) {
+  const leakedPlaceholder = /\$\d\.(?:filter|success|data)|===\$\d|&&!\$\d|\|\|\$\d/.exec(content);
+  if (leakedPlaceholder) {
+    throw new Error(`Max 思考值补丁生成了无效占位符 ${leakedPlaceholder[0]}：${filePath}`);
+  }
+}
+
+export function applyMaxEffortPatchRules(content) {
   const matchedRules = [];
   const stringRules = [
     {
       name: "legacy-max-support",
       needle: 'return!(!s.includes("opus-4-6")&&!s.includes("opus-4-7"))||!!t&&!(s.includes("haiku")||s.includes("sonnet")||s.includes("opus"))',
       replacement: "return!0"
-    },
-    {
-      name: "legacy-model-menu-section",
-      needle: 'items:O.numberedModelItems,extraSections:$,disabled:0===n.length||o',
-      replacement: 'items:iM,extraSections:[...($??iM),{key:"models",header:N.formatMessage({defaultMessage:"Models",id:"blWvagsLt7"}),items:O.numberedModelItems}],disabled:0===n.length||o'
     }
   ];
   const regexRules = [
@@ -714,6 +737,7 @@ async function patchMaxEffortSupport(resourcesDir) {
     }
 
     content = result.content;
+    assertNoMaxEffortReplacementLeaks(content, filePath);
     for (const ruleName of result.matchedRules) {
       matchedRules.add(ruleName);
     }

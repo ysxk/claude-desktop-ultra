@@ -404,8 +404,6 @@ function modelEntry(model) {
 
 export async function syncThirdPartyModels(options = {}) {
   const paths = await getAppliedConfigPath(options.rootDir);
-  const metaResult = await ensureAppliedMeta(paths);
-  const deploymentMode = await ensureDeploymentMode(paths.rootDir);
   const configExists = await pathExists(paths.configPath);
   const legacyConfigExists = !configExists && await pathExists(paths.legacyConfigPath);
   let legacyConfigMigrated = false;
@@ -420,7 +418,6 @@ export async function syncThirdPartyModels(options = {}) {
     ...config,
     ...configOverridesFromOptions(options)
   };
-  const diagnostic = diagnoseConfig(config, paths, configExists || legacyConfigMigrated, legacyConfigMigrated);
 
   let fetchedModels = [];
   let fetchError = null;
@@ -439,6 +436,20 @@ export async function syncThirdPartyModels(options = {}) {
   const existingModels = configuredModelNames(config);
   const discoveredModels = [...new Set([...requestedModels, ...fetchedModels, ...existingModels])].filter(Boolean);
   const orderedModels = orderModelsForGateway(discoveredModels);
+  const hasThirdPartyConnection = Boolean(
+    config.inferenceProvider
+      || config.inferenceGatewayBaseUrl
+      || config.inferenceGatewayApiKey
+      || config.inferenceGatewayAuthScheme === "sso"
+  );
+  const shouldActivateThirdParty = hasThirdPartyConnection || fetchedModels.length > 0;
+  const metaResult = shouldActivateThirdParty
+    ? await ensureAppliedMeta(paths)
+    : { changed: false, meta: paths.meta };
+  const deploymentMode = shouldActivateThirdParty
+    ? await ensureDeploymentMode(paths.rootDir)
+    : null;
+  const diagnostic = diagnoseConfig(config, paths, configExists || legacyConfigMigrated, legacyConfigMigrated);
   const probeResult = await findWorkingGatewayModel(config, orderedModels, {
     ...options,
     probeModels: options.probeModels !== false
@@ -446,8 +457,26 @@ export async function syncThirdPartyModels(options = {}) {
   const models = promoteModel(orderedModels, probeResult.model);
 
   if (models.length === 0) {
+    let configChanged = false;
+    if (shouldActivateThirdParty) {
+      const nextConfig = {
+        ...config,
+        unstableDisableModelVerification: true
+      };
+      const previous = JSON.stringify(config);
+      const next = JSON.stringify(nextConfig);
+      const shouldWriteConfig = previous !== next || legacyConfigMigrated || !(await pathExists(paths.configPath));
+      if (shouldWriteConfig && await pathExists(paths.configPath)) {
+        await fs.copyFile(paths.configPath, `${paths.configPath}.bak-${timestamp()}`);
+      }
+      if (shouldWriteConfig) {
+        await writeJson(paths.configPath, nextConfig);
+      }
+      configChanged = shouldWriteConfig;
+    }
+
     return {
-      changed: false,
+      changed: configChanged || metaResult.changed || Boolean(deploymentMode?.changed),
       configPath: paths.configPath,
       provider: config.inferenceProvider,
       modelCount: 0,
