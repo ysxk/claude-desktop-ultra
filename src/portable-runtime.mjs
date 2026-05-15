@@ -500,7 +500,29 @@ async function patchAsarFile(asarPath, patches) {
       continue;
     }
 
-    const replacement = Buffer.from(`${patch.prepend || ""}${original.toString("utf8")}${patch.append || ""}`, "utf8");
+    const originalText = original.toString("utf8");
+    const replacementText = patch.transform
+      ? patch.transform(originalText)
+      : `${patch.prepend || ""}${originalText}${patch.append || ""}`;
+    if (replacementText === originalText) {
+      continue;
+    }
+
+    const replacement = Buffer.from(replacementText, "utf8");
+    if (patch.inPlace) {
+      if (replacement.length > original.length) {
+        throw new Error(`app.asar 原位补丁长度超出：${patch.file} ${replacement.length}/${original.length}`);
+      }
+
+      const paddedReplacement = replacement.length === original.length
+        ? replacement
+        : Buffer.concat([replacement, Buffer.alloc(original.length - replacement.length, 0x20)]);
+      paddedReplacement.copy(archive, start);
+      entry.integrity = buildIntegrity(paddedReplacement, entry.integrity?.blockSize);
+      patched += 1;
+      continue;
+    }
+
     entry.offset = String(archive.length - parsed.dataOffset);
     entry.size = replacement.length;
     entry.integrity = buildIntegrity(replacement, entry.integrity?.blockSize);
@@ -540,6 +562,41 @@ async function patchPreloadScripts(resourcesDir, injectionSource) {
   return patchAsarFile(asarPath, [
     { file: ".vite/build/mainView.js", append, marker: PRELOAD_PATCH_MARKER },
     { file: ".vite/build/mainWindow.js", append, marker: PRELOAD_PATCH_MARKER }
+  ]);
+}
+
+function patchGatewayHealthModelSelector(content) {
+  const selectorPattern = /function (\w+)\((\w+)\)\{if\(!\(\2!=null&&\2\.length\)\)return;const (\w+)=\["haiku","sonnet","opus"\];for\(const (\w+) of \3\)\{const (\w+)=\2\.find\((\w+)=>\6\.name\.toLowerCase\(\)\.includes\(\4\)\);if\(\5\)return \5\.name\}return \2\[0\]\.name\}/;
+  const nextContent = content.replace(
+    selectorPattern,
+    (_match, functionName, modelsName) => `function ${functionName}(${modelsName}){if(!(${modelsName}!=null&&${modelsName}.length))return;return ${modelsName}[0].name}`
+  );
+
+  return nextContent;
+}
+
+function patchCoworkMsixCheck(content) {
+  const msixCheckPattern = /if\((\w+)==="win32"&&!\w+\(\)\)return\{status:"unsupported",reason:\w+\(\)\.formatMessage\(\{defaultMessage:"Cowork requires Claude Desktop be installed with our modern installer",id:"EmeqFY8DA1"\}\),unsupportedCode:"msix_required"\};/;
+  const nextContent = content.replace(
+    msixCheckPattern,
+    (_match, platformName) => `if(false&&${platformName}==="win32")return{status:"supported"};`
+  );
+
+  return nextContent;
+}
+
+async function patchPortableCompatibility(resourcesDir) {
+  const asarPath = path.join(resourcesDir, "app.asar");
+  if (!(await pathExists(asarPath))) {
+    return { patched: 0 };
+  }
+
+  return patchAsarFile(asarPath, [
+    {
+      file: ".vite/build/index.js",
+      transform: (content) => patchCoworkMsixCheck(patchGatewayHealthModelSelector(content)),
+      inPlace: true
+    }
   ]);
 }
 
@@ -708,6 +765,7 @@ export async function preparePortableRuntime(rootDir, app, dictionary, options =
   const localeStats = await patchLocale(resourcesDir, app, dictionary, options.locale || "zh-CN");
   const effortStats = await patchMaxEffortSupport(resourcesDir);
   const nativeLanguageStats = await patchNativeLanguageList(resourcesDir, options.locale || "zh-CN");
+  const compatibilityStats = await patchPortableCompatibility(resourcesDir);
   const mainProcessStats = await patchMainProcess(resourcesDir, options.injectionSource);
   const preloadStats = await patchPreloadScripts(resourcesDir, options.injectionSource);
 
@@ -722,6 +780,7 @@ export async function preparePortableRuntime(rootDir, app, dictionary, options =
         localeStats,
         effortStats,
         nativeLanguageStats,
+        compatibilityStats,
         mainProcessStats,
         preloadStats
       },
@@ -739,6 +798,7 @@ export async function preparePortableRuntime(rootDir, app, dictionary, options =
     localeStats,
     effortStats,
     nativeLanguageStats,
+    compatibilityStats,
     mainProcessStats,
     preloadStats
   };

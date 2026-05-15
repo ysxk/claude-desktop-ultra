@@ -11,7 +11,9 @@ Claude Desktop Ultra 是一个 Claude Desktop 增强器。它通过非侵入式�
 - 默认中文启动：默认以 `zh-CN` 启动 Claude，同时仍可从 Claude 原生语言设置切回其他语言。
 - UI 汉化增强：写入 `zh-CN.json`，并通过主进程 / preload 注入补足设置页、开发者模式等动态界面的翻译。
 - 第三方模型解锁：同步 Claude-3p Gateway 的 `/v1/models` 到 Claude-3p 配置，写入 `inferenceModels` 并关闭模型校验限制，让 Claude 显示非官方模型。
+- 跨机器网关兼容：启动时会把更可能可用的第三方模型排到第一位，并在存在静态 Gateway API Key 时探测可用模型，避免 Claude 健康检查误选无权限的 Sonnet / Haiku / Opus。
 - 思考档位增强：在模型思考值菜单中加入 `Max` 选项。
+- Cowork 便携兼容：绕过 Ultra 便携运行时触发的 MSIX 安装来源误判；如果系统缺少虚拟机平台 / HCS 服务，仍会保留真实系统提示。
 - 彩色应用图标：启动的 `ClaudeCNRuntime.exe` 会写入 Claude 官方彩色图标，避免任务栏显示空白或黑色托盘图标。
 - 自动桌面快捷方式：首次正常启动后会在 Windows 桌面创建 `Claude Desktop Ultra.lnk`，后续启动只复用 / 更新，不重复创建。
 - 运行时状态记录：每次准备运行时都会写入 `claude-cn-runtime.json`，记录图标、语言、Max 档位、主进程注入和 preload 注入是否成功。
@@ -63,6 +65,8 @@ npm run build:exe
 .\dist\ClaudeCN.exe launch --no-stop
 .\dist\ClaudeCN.exe launch --no-shortcut
 .\dist\ClaudeCN.exe launch --no-model-sync
+.\dist\ClaudeCN.exe launch --no-model-probe
+.\dist\ClaudeCN.exe launch --model-probe-limit 8
 .\dist\ClaudeCN.exe launch --include-non-chat-models
 .\dist\ClaudeCN.exe launch --lang=en-US
 .\dist\ClaudeCN.exe launch --port 9229
@@ -72,9 +76,16 @@ npm run build:exe
 - `--no-stop`：不关闭旧的 Claude / ClaudeCNRuntime 进程。
 - `--no-shortcut`：跳过桌面快捷方式创建 / 更新。
 - `--no-model-sync`：跳过第三方模型同步。
+- `--no-model-probe`：同步模型时不发送 `/v1/messages` 试探请求，只按模型名称排序。
+- `--model-probe-limit 8`：最多试探前 N 个模型，默认 8。
 - `--include-non-chat-models`：同步模型时包含 image、embedding、tts、audio 等非聊天模型。
 - `--lang=en-US`：临时用英文启动。
 - `--port 9229`：开启 DevTools 调试端口，方便排查注入问题。
+
+## 常见问题
+
+- 别的电脑提示 `Gateway returned an error`：通常是网关健康检查选到了该账号无权限 / 无额度的模型。新版会优先选择可用第三方模型；仍失败时，打开“开发者模式 → 配置第三方推理”，把模型列表第一项改成网关实际能调用的模型。
+- 别的电脑提示 `Reinstall required`：这是 Claude 对便携运行时的安装来源检测。Ultra 已绕过 MSIX 来源误判；如果仍提示，请确认目标电脑安装的是 Microsoft Store / MSIX 版 Claude Desktop，并重新运行新版 exe。
 
 ## 构建 exe
 

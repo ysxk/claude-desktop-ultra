@@ -56,13 +56,14 @@ Claude Desktop 简体中文非侵入式汉化启动器
 用法：
   node ./bin/claude-cn.mjs detect
   node ./bin/claude-cn.mjs audit [--write-template]
-  node ./bin/claude-cn.mjs models [--include-non-chat-models]
+  node ./bin/claude-cn.mjs models [--include-non-chat-models] [--no-model-probe]
   node ./bin/claude-cn.mjs launch [--profile profiles/zh-CN.json] [--no-stop] [--no-shortcut]
   node ./bin/claude-cn.mjs attach --port 9229
 
 说明：
   - Microsoft Store/MSIX 版会在用户目录创建便携运行时，复制 Claude 资源并覆盖 locale，不修改 WindowsApps。
   - classic 安装版仍使用 127.0.0.1 DevTools 端口注入 DOM 汉化层。
+  - 第三方 Gateway 会优先探测可用模型并放到模型列表第一位，避免健康检查误选无权限模型。
 `);
 }
 
@@ -391,7 +392,11 @@ async function runMsixPortableLaunch(app, flags) {
   }
 
   if (!flags.noModelSync) {
-    await runModelSync({ includeNonChatModels: flags.includeNonChatModels });
+    await runModelSync({
+      includeNonChatModels: flags.includeNonChatModels,
+      noModelProbe: flags.noModelProbe,
+      modelProbeLimit: flags.modelProbeLimit
+    });
   }
 
   logger.info("正在准备用户目录内的便携中文运行时。首次运行会解压 Electron，可能需要几十秒。");
@@ -400,6 +405,7 @@ async function runMsixPortableLaunch(app, flags) {
   logger.info(`中文资源已写入：${runtime.localeStats.translated}/${runtime.localeStats.total} 条。`);
   logger.info(`原生语言设置已加入中文：${runtime.nativeLanguageStats.patched} 个入口。`);
   logger.info(`Max 思考档位增强已写入：${runtime.effortStats.patched} 个入口。`);
+  logger.info(`便携兼容增强已写入：${runtime.compatibilityStats.patched} 个入口。`);
   logger.info(`主进程汉化注入已写入：${runtime.mainProcessStats.patched} 个入口。`);
   logger.info(`预加载汉化脚本已写入：${runtime.preloadStats.patched} 个入口。`);
 
@@ -422,11 +428,26 @@ async function runMsixPortableLaunch(app, flags) {
 
 async function runModelSync(flags = {}) {
   try {
+    const modelProbeLimit = flags.modelProbeLimit && flags.modelProbeLimit !== true
+      ? Number(flags.modelProbeLimit)
+      : undefined;
     const result = await syncThirdPartyModels({
-      includeNonChatModels: Boolean(flags.includeNonChatModels)
+      includeNonChatModels: Boolean(flags.includeNonChatModels),
+      probeModels: !flags.noModelProbe,
+      modelProbeLimit
     });
     if (result.modelCount > 0) {
       logger.info(`第三方模型已同步：${result.modelCount} 个（provider: ${result.provider || "unknown"}）。`);
+      if (result.verifiedModel) {
+        logger.info(`网关健康检查模型已优先使用：${result.verifiedModel}`);
+      } else if (result.probeSkipped === "missing-static-gateway-credential") {
+        logger.info("模型连通性探测已跳过：未发现静态 Gateway API Key。");
+      } else if (result.probeSkipped === "disabled") {
+        logger.info("模型连通性探测已跳过。");
+      } else if (result.probeFailures?.length > 0) {
+        const failedModels = result.probeFailures.map((failure) => failure.model).filter(Boolean).join(", ");
+        logger.warn(`模型连通性探测未找到可用模型：${failedModels || "unknown"}`);
+      }
       logger.info(`配置文件：${result.configPath}`);
     } else {
       logger.warn("没有同步到第三方模型；请检查 Claude-3p Gateway 配置。");

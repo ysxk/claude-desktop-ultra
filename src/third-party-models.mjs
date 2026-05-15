@@ -55,6 +55,29 @@ function authHeaders(config) {
   return { authorization: `Bearer ${apiKey}` };
 }
 
+function extraGatewayHeaders(config) {
+  const headers = config.inferenceGatewayHeaders;
+  if (!headers || typeof headers !== "object" || Array.isArray(headers)) {
+    return {};
+  }
+
+  return Object.fromEntries(
+    Object.entries(headers)
+      .filter(([name, value]) => typeof name === "string" && name.trim() && typeof value === "string" && value.trim())
+  );
+}
+
+function gatewayHeaders(config) {
+  return {
+    ...extraGatewayHeaders(config),
+    ...authHeaders(config)
+  };
+}
+
+function gatewayBaseUrl(config) {
+  return String(config.inferenceGatewayBaseUrl || "").replace(/\/+$/, "");
+}
+
 function normalizeModels(payload) {
   const rawModels = Array.isArray(payload?.data)
     ? payload.data
@@ -81,6 +104,38 @@ function isChatLikeModel(model) {
   return !/(^|[-_/])(image|embedding|tts|audio|whisper)([-_/]|$)/i.test(model);
 }
 
+function configuredModelNames(config) {
+  if (!Array.isArray(config.inferenceModels)) {
+    return [];
+  }
+
+  return config.inferenceModels
+    .map((model) => typeof model === "string" ? model : model?.name)
+    .filter((model) => typeof model === "string" && model.trim())
+    .map((model) => model.trim());
+}
+
+function modelPreference(model) {
+  const normalized = String(model).toLowerCase();
+  if (/(^|[-_/])(image|embedding|tts|audio|whisper)([-_/]|$)/.test(normalized)) {
+    return 100;
+  }
+  if (/(^|[-_/])(gpt|gemini|deepseek|qwen|glm|kimi|moonshot|doubao|ernie|mistral|llama|yi)([-_/0-9.]|$)/.test(normalized)) {
+    return 0;
+  }
+  if (/^claude([-/]|$)|(^|[-_/])(haiku|sonnet|opus)([-_/]|$)/.test(normalized)) {
+    return 20;
+  }
+  return 10;
+}
+
+function orderModelsForGateway(models) {
+  return models
+    .map((model, index) => ({ model, index, preference: modelPreference(model) }))
+    .sort((left, right) => left.preference - right.preference || left.index - right.index)
+    .map((entry) => entry.model);
+}
+
 async function fetchGatewayModels(config, options = {}) {
   if (config.inferenceProvider !== "gateway") {
     return [];
@@ -89,9 +144,9 @@ async function fetchGatewayModels(config, options = {}) {
     return [];
   }
 
-  const baseUrl = String(config.inferenceGatewayBaseUrl).replace(/\/+$/, "");
+  const baseUrl = gatewayBaseUrl(config);
   const response = await fetch(`${baseUrl}/v1/models`, {
-    headers: authHeaders(config)
+    headers: gatewayHeaders(config)
   });
   if (!response.ok) {
     throw new Error(`Gateway /v1/models 返回 ${response.status} ${response.statusText}`);
@@ -99,6 +154,83 @@ async function fetchGatewayModels(config, options = {}) {
 
   const models = normalizeModels(await response.json());
   return options.includeNonChatModels ? models : models.filter(isChatLikeModel);
+}
+
+function canProbeGateway(config) {
+  return config.inferenceProvider === "gateway"
+    && Boolean(config.inferenceGatewayBaseUrl)
+    && Boolean(config.inferenceGatewayApiKey)
+    && config.inferenceGatewayAuthScheme !== "sso";
+}
+
+async function probeGatewayModel(config, model, options = {}) {
+  const timeoutMs = Number(options.modelProbeTimeoutMs) || 5000;
+  const response = await fetch(`${gatewayBaseUrl(config)}/v1/messages`, {
+    method: "POST",
+    headers: {
+      ...gatewayHeaders(config),
+      "anthropic-version": "2023-06-01",
+      "content-type": "application/json"
+    },
+    body: JSON.stringify({
+      model,
+      max_tokens: 1,
+      messages: [{ role: "user", content: "." }]
+    }),
+    signal: AbortSignal.timeout(timeoutMs)
+  });
+
+  if (response.ok) {
+    return { ok: true, model, status: response.status };
+  }
+
+  const responseBody = (await response.text().catch(() => "")).slice(0, 300);
+  return {
+    ok: false,
+    model,
+    status: response.status,
+    statusText: response.statusText,
+    responseBody
+  };
+}
+
+async function findWorkingGatewayModel(config, models, options = {}) {
+  if (!options.probeModels) {
+    return { skipped: "disabled" };
+  }
+  if (!canProbeGateway(config)) {
+    return { skipped: "missing-static-gateway-credential" };
+  }
+
+  const limit = Math.max(1, Math.min(Number(options.modelProbeLimit) || 8, models.length));
+  const failures = [];
+  for (const model of models.slice(0, limit)) {
+    try {
+      const result = await probeGatewayModel(config, model, options);
+      if (result.ok) {
+        return { model, failures };
+      }
+      failures.push(result);
+      if (result.status === 401 || result.status === 403) {
+        break;
+      }
+    } catch (error) {
+      failures.push({
+        model,
+        error: error instanceof Error ? error.message : String(error)
+      });
+    }
+  }
+
+  return { failures };
+}
+
+function promoteModel(models, preferredModel) {
+  if (!preferredModel || !models.includes(preferredModel)) {
+    return models;
+  }
+
+  return [preferredModel, ...models.filter((model) => model !== preferredModel)];
 }
 
 function displayLabel(model) {
@@ -134,7 +266,14 @@ export async function syncThirdPartyModels(options = {}) {
 
   const fetchedModels = await fetchGatewayModels(config, options);
   const requestedModels = Array.isArray(options.models) ? options.models : [];
-  const models = [...new Set([...requestedModels, ...fetchedModels])].filter(Boolean);
+  const existingModels = configuredModelNames(config);
+  const discoveredModels = [...new Set([...requestedModels, ...fetchedModels, ...existingModels])].filter(Boolean);
+  const orderedModels = orderModelsForGateway(discoveredModels);
+  const probeResult = await findWorkingGatewayModel(config, orderedModels, {
+    ...options,
+    probeModels: options.probeModels !== false
+  });
+  const models = promoteModel(orderedModels, probeResult.model);
 
   if (models.length === 0) {
     return {
@@ -142,7 +281,10 @@ export async function syncThirdPartyModels(options = {}) {
       configPath: paths.configPath,
       provider: config.inferenceProvider,
       modelCount: 0,
-      models: []
+      models: [],
+      verifiedModel: null,
+      probeSkipped: probeResult.skipped || null,
+      probeFailures: probeResult.failures || []
     };
   }
 
@@ -166,6 +308,9 @@ export async function syncThirdPartyModels(options = {}) {
     configPath: paths.configPath,
     provider: nextConfig.inferenceProvider,
     modelCount: models.length,
-    models
+    models,
+    verifiedModel: probeResult.model || null,
+    probeSkipped: probeResult.skipped || null,
+    probeFailures: probeResult.failures || []
   };
 }
