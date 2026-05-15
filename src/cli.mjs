@@ -57,7 +57,7 @@ Claude Desktop 简体中文非侵入式汉化启动器
   node ./bin/claude-cn.mjs detect
   node ./bin/claude-cn.mjs audit [--write-template]
   node ./bin/claude-cn.mjs models [--include-non-chat-models]
-  node ./bin/claude-cn.mjs launch [--profile profiles/zh-CN.json] [--no-stop]
+  node ./bin/claude-cn.mjs launch [--profile profiles/zh-CN.json] [--no-stop] [--no-shortcut]
   node ./bin/claude-cn.mjs attach --port 9229
 
 说明：
@@ -153,6 +153,14 @@ async function stopProcesses(processNames) {
   const script = `
 $ErrorActionPreference = "SilentlyContinue"
 Get-Process -Name ${names} -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+$deadline = (Get-Date).AddSeconds(15)
+do {
+  $running = Get-Process -Name ${names} -ErrorAction SilentlyContinue
+  if (-not $running) {
+    break
+  }
+  Start-Sleep -Milliseconds 250
+} while ((Get-Date) -lt $deadline)
 exit 0
 `;
 
@@ -172,6 +180,159 @@ function resolveLocale(profile, flags = {}) {
 
 function shouldOverrideLocale(profile, flags = {}) {
   return Boolean(flags.locale || flags.lang || profile.localeOverride);
+}
+
+function powershellString(value) {
+  return `'${String(value || "").replace(/'/g, "''")}'`;
+}
+
+function resolveShortcutLaunchTarget(rootDir) {
+  if (process.pkg) {
+    return {
+      targetPath: process.execPath,
+      arguments: "launch",
+      workingDirectory: path.dirname(process.execPath)
+    };
+  }
+
+  return {
+    targetPath: process.execPath,
+    arguments: `"${path.join(rootDir, "bin", "claude-cn.mjs")}" launch`,
+    workingDirectory: rootDir
+  };
+}
+
+async function ensureDesktopShortcut(rootDir, options = {}) {
+  const launchTarget = resolveShortcutLaunchTarget(rootDir);
+  const iconPath = options.iconPath || launchTarget.targetPath;
+  const legacyScriptPath = path.join(rootDir, "scripts", "Start-ClaudeCN.ps1");
+  const script = `
+$ErrorActionPreference = "Stop"
+$targetPath = ${powershellString(launchTarget.targetPath)}
+$argumentsText = ${powershellString(launchTarget.arguments)}
+$workingDirectory = ${powershellString(launchTarget.workingDirectory)}
+$iconPath = ${powershellString(iconPath)}
+$legacyScriptPath = ${powershellString(legacyScriptPath)}
+$shortcutName = "Claude Desktop Ultra.lnk"
+$legacyNames = @("Claude Desktop Ultra.lnk", "Claude CN.lnk")
+$description = "Claude Desktop Ultra - non-invasive Claude Desktop enhancer"
+
+$shell = New-Object -ComObject WScript.Shell
+
+function Normalize-Path([string] $value) {
+  if ([string]::IsNullOrWhiteSpace($value)) {
+    return ""
+  }
+  try {
+    return [IO.Path]::GetFullPath($value).TrimEnd("\\").ToLowerInvariant()
+  } catch {
+    return $value.Trim().TrimEnd("\\").ToLowerInvariant()
+  }
+}
+
+function Is-UltraShortcut($file) {
+  try {
+    $shortcut = $shell.CreateShortcut($file.FullName)
+    $name = $file.Name
+    $target = Normalize-Path $shortcut.TargetPath
+    $arguments = "$($shortcut.Arguments)"
+    $existingDescription = "$($shortcut.Description)"
+    $isSameTarget = $target -eq (Normalize-Path $targetPath)
+    $isLegacyScript = $arguments.IndexOf($legacyScriptPath, [StringComparison]::OrdinalIgnoreCase) -ge 0
+    $isMarked = $existingDescription.IndexOf("Claude Desktop Ultra", [StringComparison]::OrdinalIgnoreCase) -ge 0 -or
+      $existingDescription.IndexOf("non-invasive zh-CN overlay", [StringComparison]::OrdinalIgnoreCase) -ge 0
+    $isKnownName = $legacyNames -contains $name
+    return $isSameTarget -or $isLegacyScript -or ($isKnownName -and $isMarked) -or ($name -eq $shortcutName)
+  } catch {
+    return $false
+  }
+}
+
+$userDesktop = [Environment]::GetFolderPath([Environment+SpecialFolder]::DesktopDirectory)
+if ([string]::IsNullOrWhiteSpace($userDesktop)) {
+  $userDesktop = [Environment]::GetFolderPath("Desktop")
+}
+if ([string]::IsNullOrWhiteSpace($userDesktop)) {
+  throw "Cannot resolve user desktop path"
+}
+[IO.Directory]::CreateDirectory($userDesktop) | Out-Null
+
+$desktopDirs = New-Object 'System.Collections.Generic.List[string]'
+$desktopDirs.Add($userDesktop)
+$commonDesktop = [Environment]::GetFolderPath([Environment+SpecialFolder]::CommonDesktopDirectory)
+if (-not [string]::IsNullOrWhiteSpace($commonDesktop) -and $commonDesktop -ne $userDesktop) {
+  $desktopDirs.Add($commonDesktop)
+}
+
+$existing = $null
+foreach ($desktopDir in $desktopDirs) {
+  if (-not [IO.Directory]::Exists($desktopDir)) {
+    continue
+  }
+  $existing = Get-ChildItem -LiteralPath $desktopDir -Filter "*.lnk" -File -ErrorAction SilentlyContinue |
+    Where-Object { Is-UltraShortcut $_ } |
+    Select-Object -First 1
+  if ($existing) {
+    break
+  }
+}
+
+if ($existing) {
+  $shortcutPath = $existing.FullName
+  $created = $false
+} else {
+  $shortcutPath = Join-Path $userDesktop $shortcutName
+  $created = $true
+}
+
+$shortcut = $shell.CreateShortcut($shortcutPath)
+$shortcut.TargetPath = $targetPath
+$shortcut.Arguments = $argumentsText
+$shortcut.WorkingDirectory = $workingDirectory
+if (-not [string]::IsNullOrWhiteSpace($iconPath) -and [IO.File]::Exists($iconPath)) {
+  if ([IO.Path]::GetExtension($iconPath).Equals(".ico", [StringComparison]::OrdinalIgnoreCase)) {
+    $shortcut.IconLocation = $iconPath
+  } else {
+    $shortcut.IconLocation = "$iconPath,0"
+  }
+}
+$shortcut.Description = $description
+$shortcut.Save()
+
+[pscustomobject]@{
+  created = $created
+  shortcutPath = $shortcutPath
+  targetPath = $targetPath
+  arguments = $argumentsText
+  iconPath = $iconPath
+} | ConvertTo-Json -Compress
+`;
+
+  const { stdout } = await execFileAsync("powershell.exe", ["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script], {
+    windowsHide: true,
+    maxBuffer: 1024 * 1024
+  });
+  const output = stdout.trim().split(/\r?\n/).filter(Boolean).pop();
+  return output ? JSON.parse(output) : null;
+}
+
+async function ensureDesktopShortcutForLaunch(options = {}, flags = {}) {
+  if (flags.noShortcut || flags.dryRun) {
+    return null;
+  }
+
+  try {
+    const shortcut = await ensureDesktopShortcut(rootDir, options);
+    if (shortcut?.created) {
+      logger.info(`桌面快捷方式已创建：${shortcut.shortcutPath}`);
+    } else if (shortcut?.shortcutPath) {
+      logger.info(`桌面快捷方式已存在，已复用：${shortcut.shortcutPath}`);
+    }
+    return shortcut;
+  } catch (error) {
+    logger.warn(`桌面快捷方式创建失败，继续启动：${error.message}`);
+    return null;
+  }
 }
 
 function launchPortableRuntime(runtime, profile, options = {}) {
@@ -253,6 +414,7 @@ async function runMsixPortableLaunch(app, flags) {
     throw new Error("端口无效。请使用 `--port 9229` 这样的正整数。");
   }
 
+  await ensureDesktopShortcutForLaunch({ iconPath: runtime.iconStats?.iconPath || runtime.runtimeExe }, flags);
   const processId = launchPortableRuntime(runtime, profile, { locale, port });
   logger.info(`已启动便携 Claude 中文版：PID ${processId}`);
   logger.info(`运行时目录：${runtime.runtimeDir}`);
@@ -302,6 +464,7 @@ async function runLaunch(flags) {
     throw new Error("Claude 已在运行。请先从托盘/任务管理器完全退出 Claude，再运行插件；如果已手动开启 DevTools 端口，可用 `attach --port <端口>`。");
   }
 
+  await ensureDesktopShortcutForLaunch({ iconPath: app.executable }, flags);
   launchClaude(app, port, flags);
   await waitForCdp(port);
   logger.info(`汉化层已就绪：${profile.name || profile.locale}`);

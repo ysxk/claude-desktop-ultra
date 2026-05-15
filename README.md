@@ -13,6 +13,7 @@ Claude Desktop Ultra 是一个 Claude Desktop 增强器。它通过非侵入式�
 - 第三方模型解锁：同步 Claude-3p Gateway 的 `/v1/models` 到 Claude-3p 配置，写入 `inferenceModels` 并关闭模型校验限制，让 Claude 显示非官方模型。
 - 思考档位增强：在模型思考值菜单中加入 `Max` 选项。
 - 彩色应用图标：启动的 `ClaudeCNRuntime.exe` 会写入 Claude 官方彩色图标，避免任务栏显示空白或黑色托盘图标。
+- 自动桌面快捷方式：首次正常启动后会在 Windows 桌面创建 `Claude Desktop Ultra.lnk`，后续启动只复用 / 更新，不重复创建。
 - 运行时状态记录：每次准备运行时都会写入 `claude-cn-runtime.json`，记录图标、语言、Max 档位、主进程注入和 preload 注入是否成功。
 
 ## 使用方法
@@ -52,6 +53,7 @@ npm run build:exe
 ```powershell
 .\dist\ClaudeCN.exe launch --dry-run
 .\dist\ClaudeCN.exe launch --no-stop
+.\dist\ClaudeCN.exe launch --no-shortcut
 .\dist\ClaudeCN.exe launch --no-model-sync
 .\dist\ClaudeCN.exe launch --include-non-chat-models
 .\dist\ClaudeCN.exe launch --lang=en-US
@@ -60,6 +62,7 @@ npm run build:exe
 
 - `--dry-run`：只准备运行时并打印启动路径，不真正启动 Claude。
 - `--no-stop`：不关闭旧的 Claude / ClaudeCNRuntime 进程。
+- `--no-shortcut`：跳过桌面快捷方式创建 / 更新。
 - `--no-model-sync`：跳过第三方模型同步。
 - `--include-non-chat-models`：同步模型时包含 image、embedding、tts、audio 等非聊天模型。
 - `--lang=en-US`：临时用英文启动。

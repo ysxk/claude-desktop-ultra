@@ -24,6 +24,28 @@ async function pathExists(filePath) {
   }
 }
 
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function retryBusyFileOperation(operation, retries = 8) {
+  let lastError = null;
+
+  for (let attempt = 0; attempt <= retries; attempt += 1) {
+    try {
+      return await operation();
+    } catch (error) {
+      lastError = error;
+      if (!["EBUSY", "EPERM", "ENOTEMPTY"].includes(error?.code) || attempt === retries) {
+        throw error;
+      }
+      await sleep(250 * (attempt + 1));
+    }
+  }
+
+  throw lastError;
+}
+
 async function expandZip(zipPath, destination) {
   const script = `
 $ErrorActionPreference = "Stop"
@@ -680,7 +702,7 @@ export async function preparePortableRuntime(rootDir, app, dictionary, options =
   const resourcesDir = path.join(runtimeDir, "resources");
 
   await fs.mkdir(resourcesDir, { recursive: true });
-  await fs.cp(app.resourcesDir, resourcesDir, { recursive: true, force: true });
+  await retryBusyFileOperation(() => fs.cp(app.resourcesDir, resourcesDir, { recursive: true, force: true }));
   const runtimeIconPath = await resolveRuntimeIconPath(app, resourcesDir, runtimeDir);
   const iconStats = await patchExecutableIcon(runtimeExe, runtimeIconPath);
   const localeStats = await patchLocale(resourcesDir, app, dictionary, options.locale || "zh-CN");
