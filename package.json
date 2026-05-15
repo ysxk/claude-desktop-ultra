@@ -1,0 +1,35 @@
+{
+  "name": "claude-desktop-zh-cn-overlay",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "非侵入式 Claude Desktop 简体中文汉化覆盖层",
+  "bin": {
+    "claude-cn": "./bin/claude-cn.mjs"
+  },
+  "scripts": {
+    "detect": "node ./bin/claude-cn.mjs detect",
+    "audit": "node ./bin/claude-cn.mjs audit",
+    "launch": "node ./bin/claude-cn.mjs launch",
+    "build:exe": "npx --yes @yao-pkg/pkg . --targets node22-win-x64 --output dist/ClaudeCN.exe"
+  },
+  "pkg": {
+    "scripts": [
+      "bin/**/*.mjs",
+      "src/**/*.mjs"
+    ],
+    "assets": [
+      "profiles/**/*.json",
+      "locales/**/*.json",
+      "src/**/*.txt",
+      "config/**/*.json",
+      "vendor/**/*.zip",
+      "README.md",
+      "docs/**/*.md",
+      "plugin.json"
+    ]
+  },
+  "engines": {
+    "node": ">=22.0.0"
+  }
+}

@@ -1,0 +1,543 @@
+function injectedRuntime(config) {
+  const globalKey = "__CLAUDE_ZH_CN_OVERLAY__";
+  const languageCardId = "claude-ultra-language-card";
+  const localeChoiceKey = "__claude_ultra_locale_choice__";
+
+  const createOverlay = () => {
+    const state = {
+      config,
+      dictionary: new Map(),
+      patterns: [],
+      mutating: false,
+      observer: null,
+      refreshTimer: null,
+      currentLocale: null,
+      enabled: true,
+      originalText: new WeakMap(),
+      originalAttributes: new WeakMap(),
+      originalInputValues: new WeakMap(),
+      originalElementText: new WeakMap(),
+      normalizedDictionary: new Map(),
+      segmentEntries: []
+    };
+
+    const normalizeLocale = (value) => String(value || "").replace("_", "-").toLowerCase();
+
+    const isTargetLocale = (value) => {
+      const locale = normalizeLocale(value);
+      const target = normalizeLocale(state.config.locale || "zh-CN");
+      return locale === target || (target.startsWith("zh-") && locale.startsWith("zh"));
+    };
+
+    const readCurrentLocale = () => {
+      const desktopIntl = globalThis["claude.hybrid"]?.DesktopIntl;
+      try {
+        const initialLocale = desktopIntl?.getInitialLocale?.();
+        if (typeof initialLocale === "string") {
+          return initialLocale;
+        }
+        if (initialLocale && typeof initialLocale.locale === "string") {
+          return initialLocale.locale;
+        }
+      } catch {}
+
+      if (typeof window.initialLocale === "string") {
+        return window.initialLocale;
+      }
+      if (window.initialLocale && typeof window.initialLocale.locale === "string") {
+        return window.initialLocale.locale;
+      }
+
+      return document.documentElement?.lang || state.config.locale || "zh-CN";
+    };
+
+    const readStoredLocale = () => {
+      try {
+        return localStorage.getItem(localeChoiceKey);
+      } catch {
+        return null;
+      }
+    };
+
+    const writeStoredLocale = (locale) => {
+      try {
+        localStorage.setItem(localeChoiceKey, locale);
+      } catch {}
+    };
+
+    const preferredLocale = () => {
+      if (state.config.localeOverride) {
+        return state.config.launchLocale || state.config.locale || "zh-CN";
+      }
+      return readStoredLocale() || state.config.launchLocale || state.config.locale || "zh-CN";
+    };
+
+    const syncEnabled = () => {
+      const currentLocale = state.currentLocale || readCurrentLocale();
+      state.enabled = isTargetLocale(currentLocale);
+      if (document.documentElement) {
+        document.documentElement.setAttribute("data-claude-ultra-locale", currentLocale);
+        document.documentElement.lang = currentLocale;
+      }
+    };
+
+    const escapeRegExp = (value) => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+    const compilePlaceholderPattern = (source, target) => {
+      if (!source.includes("{") || source.includes("plural,")) {
+        return null;
+      }
+
+      const literalText = source.replace(/\{[a-zA-Z0-9_]+\}/g, "");
+      if (literalText.replace(/\s+/g, "").length < 4) {
+        return null;
+      }
+
+      const names = [];
+      const pattern = escapeRegExp(source).replace(/\\\{([a-zA-Z0-9_]+)\\\}/g, (_, name) => {
+        names.push(name);
+        return "(.+?)";
+      });
+
+      if (names.length === 0) {
+        return null;
+      }
+
+      return {
+        regex: new RegExp(`^${pattern}$`),
+        render(match) {
+          let rendered = target;
+          names.forEach((name, index) => {
+            rendered = rendered.replaceAll(`{${name}}`, match[index + 1]);
+          });
+          return rendered;
+        }
+      };
+    };
+
+    const update = (nextConfig) => {
+      state.config = nextConfig;
+      state.dictionary = new Map(Object.entries(nextConfig.dictionary || {}));
+      state.normalizedDictionary = new Map(
+        Object.entries(nextConfig.dictionary || {}).map(([source, target]) => [source.replace(/\s+/g, " ").trim(), target])
+      );
+      state.segmentEntries = Object.entries(nextConfig.dictionary || {})
+        .filter(([source, target]) => (
+          typeof source === "string"
+          && typeof target === "string"
+          && source.length >= 5
+          && /[A-Za-z]/.test(source)
+          && source !== target
+        ))
+        .sort(([left], [right]) => right.length - left.length);
+      state.patterns = Object.entries(nextConfig.dictionary || {})
+        .map(([source, target]) => compilePlaceholderPattern(source, target))
+        .filter(Boolean);
+      syncEnabled();
+    };
+
+    const withMutationPause = (fn) => {
+      if (state.mutating) {
+        return;
+      }
+      state.mutating = true;
+      try {
+        fn();
+      } finally {
+        setTimeout(() => {
+          state.mutating = false;
+        }, 0);
+      }
+    };
+
+    const splitWhitespace = (value) => {
+      const leading = value.match(/^\s*/)?.[0] ?? "";
+      const trailing = value.match(/\s*$/)?.[0] ?? "";
+      const body = value.slice(leading.length, value.length - trailing.length);
+      return { leading, body, trailing };
+    };
+
+    const translate = (value) => {
+      if (!value || typeof value !== "string") {
+        return value;
+      }
+
+      const { leading, body, trailing } = splitWhitespace(value);
+      if (!body) {
+        return value;
+      }
+
+      const exact = state.dictionary.get(body);
+      if (exact) {
+        return `${leading}${exact}${trailing}`;
+      }
+
+      const normalizedBody = body.replace(/\s+/g, " ").trim();
+      const normalized = state.normalizedDictionary.get(normalizedBody);
+      if (normalized) {
+        return `${leading}${normalized}${trailing}`;
+      }
+
+      for (const pattern of state.patterns) {
+        const match = body.match(pattern.regex);
+        if (match) {
+          return `${leading}${pattern.render(match)}${trailing}`;
+        }
+      }
+
+      if (location.href.includes("/settings") && /[A-Za-z]/.test(body)) {
+        let rendered = body;
+        for (const [source, target] of state.segmentEntries) {
+          if (rendered.includes(source)) {
+            rendered = rendered.replaceAll(source, target);
+          }
+        }
+        if (rendered !== body) {
+          return `${leading}${rendered}${trailing}`;
+        }
+      }
+
+      return value;
+    };
+
+    const skipSelector = () => state.config.skipTextSelectors?.join(",") || "";
+
+    const shouldSkipTextNode = (node) => {
+      const parent = node.parentElement;
+      if (!parent) {
+        return true;
+      }
+      const selector = skipSelector();
+      return Boolean(selector && parent.closest(selector));
+    };
+
+    const originalTextFor = (node) => {
+      if (!state.originalText.has(node)) {
+        state.originalText.set(node, node.nodeValue);
+      }
+      return state.originalText.get(node);
+    };
+
+    const processTextNode = (node) => {
+      if (shouldSkipTextNode(node)) {
+        return;
+      }
+      const original = originalTextFor(node);
+      const next = state.enabled ? translate(original) : original;
+      if (next !== node.nodeValue) {
+        node.nodeValue = next;
+      }
+    };
+
+    const originalAttributeFor = (element, attribute) => {
+      let attributes = state.originalAttributes.get(element);
+      if (!attributes) {
+        attributes = new Map();
+        state.originalAttributes.set(element, attributes);
+      }
+      if (!attributes.has(attribute)) {
+        attributes.set(attribute, element.getAttribute(attribute));
+      }
+      return attributes.get(attribute);
+    };
+
+    const originalInputValueFor = (element) => {
+      if (!state.originalInputValues.has(element)) {
+        state.originalInputValues.set(element, element.value);
+      }
+      return state.originalInputValues.get(element);
+    };
+
+    const originalElementTextFor = (element) => {
+      if (!state.originalElementText.has(element)) {
+        state.originalElementText.set(element, element.textContent);
+      }
+      return state.originalElementText.get(element);
+    };
+
+    const processElement = (element) => {
+      if (!(element instanceof Element)) {
+        return;
+      }
+
+      for (const attribute of state.config.translateAttributes || []) {
+        if (!element.hasAttribute(attribute)) {
+          continue;
+        }
+        const original = originalAttributeFor(element, attribute);
+        const next = state.enabled ? translate(original) : original;
+        if (next !== element.getAttribute(attribute)) {
+          element.setAttribute(attribute, next);
+        }
+      }
+
+      if (element instanceof HTMLInputElement && ["button", "submit", "reset"].includes(element.type)) {
+        const original = originalInputValueFor(element);
+        const next = state.enabled ? translate(original) : original;
+        if (next !== element.value) {
+          element.value = next;
+        }
+      }
+
+      if (element.childElementCount === 0 && !["SCRIPT", "STYLE", "NOSCRIPT", "CODE", "PRE", "KBD", "SAMP", "TEXTAREA", "INPUT"].includes(element.tagName)) {
+        const original = originalElementTextFor(element);
+        if (typeof original === "string") {
+          const next = state.enabled ? translate(original) : original;
+          if (next !== element.textContent) {
+            element.textContent = next;
+          }
+        }
+      }
+    };
+
+    const renderLanguageCard = () => {
+      if (!document.body) {
+        return;
+      }
+
+      let card = document.getElementById(languageCardId);
+      const inSettings = false && location.href.includes("/settings");
+      if (!inSettings) {
+        card?.remove();
+        return;
+      }
+
+      if (!card) {
+        card = document.createElement("section");
+        card.id = languageCardId;
+        card.setAttribute("data-claude-cn-skip", "true");
+        card.style.cssText = [
+          "position:fixed",
+          "right:24px",
+          "bottom:24px",
+          "z-index:2147483647",
+          "width:260px",
+          "box-sizing:border-box",
+          "border:1px solid rgba(0,0,0,.12)",
+          "border-radius:14px",
+          "background:rgba(255,255,255,.96)",
+          "box-shadow:0 10px 30px rgba(0,0,0,.12)",
+          "padding:14px",
+          "font:13px/1.4 system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif",
+          "color:#2f2a24"
+        ].join(";");
+        document.body.appendChild(card);
+      }
+
+      const locale = normalizeLocale(state.currentLocale || readCurrentLocale());
+      const chineseActive = isTargetLocale(locale);
+      const title = state.enabled ? "Claude Desktop Ultra" : "Claude Desktop Ultra";
+      const label = state.enabled ? "界面语言" : "Interface language";
+      const hint = state.enabled ? "这里是新增语言选项，英文资源仍保留。" : "Chinese is added as an extra locale; English stays intact.";
+      card.replaceChildren();
+
+      const heading = document.createElement("div");
+      heading.textContent = title;
+      heading.style.cssText = "font-weight:650;margin-bottom:8px";
+      card.appendChild(heading);
+
+      const description = document.createElement("div");
+      description.textContent = `${label} · ${hint}`;
+      description.style.cssText = "color:#6f665d;margin-bottom:12px";
+      card.appendChild(description);
+
+      const row = document.createElement("div");
+      row.style.cssText = "display:flex;gap:8px";
+      card.appendChild(row);
+
+      const buttonStyle = (active) => [
+        "flex:1",
+        "border-radius:999px",
+        "padding:7px 10px",
+        "cursor:pointer",
+        "font:inherit",
+        active ? "border:1px solid #d97745;background:#fff1e8;color:#7a3516" : "border:1px solid rgba(0,0,0,.12);background:#fff;color:#3d362f"
+      ].join(";");
+
+      const englishButton = document.createElement("button");
+      englishButton.type = "button";
+      englishButton.textContent = "English";
+      englishButton.style.cssText = buttonStyle(!chineseActive);
+      englishButton.addEventListener("click", () => requestLocale(state.config.fallbackLocale || "en-US"));
+      row.appendChild(englishButton);
+
+      const chineseButton = document.createElement("button");
+      chineseButton.type = "button";
+      chineseButton.textContent = "简体中文";
+      chineseButton.style.cssText = buttonStyle(chineseActive);
+      chineseButton.addEventListener("click", () => requestLocale(state.config.locale || "zh-CN"));
+      row.appendChild(chineseButton);
+    };
+
+    const processRootInternal = (root) => {
+      if (root.nodeType === Node.TEXT_NODE) {
+        processTextNode(root);
+        return;
+      }
+
+      if (root.nodeType !== Node.ELEMENT_NODE && root.nodeType !== Node.DOCUMENT_NODE && root.nodeType !== Node.DOCUMENT_FRAGMENT_NODE) {
+        return;
+      }
+
+      if (root.nodeType === Node.ELEMENT_NODE) {
+        processElement(root);
+        if (root.shadowRoot) {
+          processRootInternal(root.shadowRoot);
+        }
+      }
+
+      const walker = document.createTreeWalker(
+        root,
+        NodeFilter.SHOW_ELEMENT | NodeFilter.SHOW_TEXT
+      );
+
+      for (let node = walker.nextNode(); node; node = walker.nextNode()) {
+        if (node.nodeType === Node.ELEMENT_NODE) {
+          processElement(node);
+          if (node.shadowRoot) {
+            processRootInternal(node.shadowRoot);
+          }
+        } else if (node.nodeType === Node.TEXT_NODE) {
+          processTextNode(node);
+        }
+      }
+
+      if (state.enabled) {
+        document.title = translate(document.title);
+      }
+    };
+
+    const processRoot = (root) => {
+      withMutationPause(() => {
+        syncEnabled();
+        processRootInternal(root);
+        renderLanguageCard();
+      });
+    };
+
+    const refresh = () => {
+      if (document.documentElement) {
+        processRoot(document.documentElement);
+      } else {
+        renderLanguageCard();
+      }
+    };
+
+    const scheduleRefresh = (delay = 60) => {
+      if (state.refreshTimer !== null) {
+        clearTimeout(state.refreshTimer);
+      }
+      state.refreshTimer = setTimeout(() => {
+        state.refreshTimer = null;
+        refresh();
+      }, delay);
+    };
+
+    const setLocale = (locale) => {
+      state.currentLocale = locale;
+      refresh();
+      scheduleRefresh(400);
+    };
+
+    const requestLocale = (locale, options = {}) => {
+      if (options.persist !== false) {
+        writeStoredLocale(locale);
+      }
+      setLocale(locale);
+      const desktopIntl = globalThis["claude.hybrid"]?.DesktopIntl;
+      if (desktopIntl?.requestLocaleChange) {
+        Promise.resolve(desktopIntl.requestLocaleChange(locale)).catch(() => setLocale(readCurrentLocale()));
+      }
+    };
+
+    const hookNavigation = () => {
+      for (const method of ["pushState", "replaceState"]) {
+        const original = history[method];
+        if (original?.__claudeUltraPatched) {
+          continue;
+        }
+        const patched = function patchedHistoryMethod(...args) {
+          const result = original.apply(this, args);
+          setTimeout(refresh, 0);
+          scheduleRefresh(600);
+          return result;
+        };
+        patched.__claudeUltraPatched = true;
+        history[method] = patched;
+      }
+      window.addEventListener("popstate", refresh);
+    };
+
+    const hookLocaleChanges = () => {
+      const desktopIntl = globalThis["claude.hybrid"]?.DesktopIntl;
+      desktopIntl?.onLocaleChanged?.((locale) => {
+        writeStoredLocale(locale);
+        setLocale(locale);
+      });
+    };
+
+    const start = () => {
+      update(config);
+      state.currentLocale = readCurrentLocale();
+      hookNavigation();
+      hookLocaleChanges();
+      const desiredLocale = preferredLocale();
+      if (normalizeLocale(desiredLocale) !== normalizeLocale(state.currentLocale)) {
+        requestLocale(desiredLocale, { persist: false });
+      } else {
+        refresh();
+      }
+      for (const delay of [250, 1000, 2500, 5000]) {
+        setTimeout(refresh, delay);
+      }
+
+      state.observer = new MutationObserver((records) => {
+        if (state.mutating) {
+          scheduleRefresh(80);
+          return;
+        }
+
+        withMutationPause(() => {
+          syncEnabled();
+          for (const record of records) {
+            if (record.type === "characterData") {
+              processRootInternal(record.target);
+            } else if (record.type === "attributes") {
+              processRootInternal(record.target);
+            } else {
+              for (const node of record.addedNodes) {
+                processRootInternal(node);
+              }
+            }
+          }
+          renderLanguageCard();
+        });
+      });
+
+      state.observer.observe(document.documentElement || document, {
+        subtree: true,
+        childList: true,
+        characterData: true,
+        attributes: true,
+        attributeFilter: state.config.translateAttributes || undefined
+      });
+    };
+
+    return { update, refresh, start, setLocale, requestLocale };
+  };
+
+  if (window[globalKey]) {
+    window[globalKey].update(config);
+    window[globalKey].refresh();
+    return;
+  }
+
+  const overlay = createOverlay();
+  window[globalKey] = overlay;
+
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", () => overlay.start(), { once: true });
+  } else {
+    overlay.start();
+  }
+}

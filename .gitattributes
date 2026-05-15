@@ -1,0 +1,2 @@
+dist/*.exe filter=lfs diff=lfs merge=lfs -text
+vendor/*.zip filter=lfs diff=lfs merge=lfs -text

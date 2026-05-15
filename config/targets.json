@@ -1,0 +1,23 @@
+{
+  "targets": [
+    {
+      "id": "claude-desktop-msix",
+      "displayName": "Claude Desktop (Microsoft Store / MSIX)",
+      "appxName": "Claude",
+      "executableRelativePath": "app\\Claude.exe",
+      "resourcesRelativePath": "app\\resources",
+      "supportedVersions": "*"
+    },
+    {
+      "id": "claude-desktop-classic",
+      "displayName": "Claude Desktop (classic installer)",
+      "candidateExecutables": [
+        "%LOCALAPPDATA%\\Programs\\Claude\\Claude.exe",
+        "%PROGRAMFILES%\\Claude\\Claude.exe",
+        "%PROGRAMFILES(X86)%\\Claude\\Claude.exe"
+      ],
+      "resourcesRelativePath": "resources",
+      "supportedVersions": "*"
+    }
+  ]
+}

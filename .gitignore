@@ -1,0 +1,10 @@
+node_modules/
+npm-debug.log*
+
+dist/*
+!dist/ClaudeCN.exe
+
+dist/test-logs/
+
+*.tmp
+*.log
