@@ -157,6 +157,11 @@ function injectedRuntime(config) {
       return { leading, body, trailing };
     };
 
+    const isSettingsLikePage = () => {
+      const href = location.href || "";
+      return href.includes("/settings") || href.includes("setup-desktop-3p");
+    };
+
     const translate = (value) => {
       if (!value || typeof value !== "string") {
         return value;
@@ -185,7 +190,12 @@ function injectedRuntime(config) {
         }
       }
 
-      if (location.href.includes("/settings") && /[A-Za-z]/.test(body)) {
+      const connectionNeedsMatch = body.match(/^(?:\d+\s+)?Connection needs\s+(\d+)\s+fields?$/);
+      if (connectionNeedsMatch) {
+        return `${leading}连接还需要 ${connectionNeedsMatch[1]} 个字段${trailing}`;
+      }
+
+      if (isSettingsLikePage() && /[A-Za-z]/.test(body)) {
         let rendered = body;
         for (const [source, target] of state.segmentEntries) {
           if (rendered.includes(source)) {
