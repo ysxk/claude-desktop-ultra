@@ -1,6 +1,6 @@
 {
   "name": "claude-desktop-zh-cn-overlay",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "private": true,
   "type": "module",
   "description": "非侵入式 Claude Desktop 简体中文汉化覆盖层",
