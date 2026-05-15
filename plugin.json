@@ -1,7 +1,7 @@
 {
   "id": "claude-desktop.zh-cn-overlay",
-  "name": "Claude Desktop 简体中文非侵入式汉化插件",
-  "version": "0.1.0",
+  "name": "Claude Desktop Ultra",
+  "version": "0.1.2",
   "entry": "bin/claude-cn.mjs",
   "target": {
     "app": "Claude Desktop",
@@ -13,7 +13,7 @@
     "nonInvasive": true,
     "writesIntoApplicationDirectory": false,
     "requiresAdministrator": false,
-    "mechanism": "Launch Claude with localhost CDP debugging and inject a DOM translation overlay."
+    "mechanism": "Launch Claude through a portable runtime overlay with zh-CN locale, UI translation, third-party model sync, and compatibility patches."
   },
   "permissions": [
     "read-installed-claude-location",

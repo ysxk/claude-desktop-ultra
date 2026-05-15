@@ -30,7 +30,10 @@ function parseArgs(argv) {
       continue;
     }
 
-    const [rawName, inlineValue] = arg.slice(2).split("=", 2);
+    const optionText = arg.slice(2);
+    const equalsIndex = optionText.indexOf("=");
+    const rawName = equalsIndex >= 0 ? optionText.slice(0, equalsIndex) : optionText;
+    const inlineValue = equalsIndex >= 0 ? optionText.slice(equalsIndex + 1) : undefined;
     const name = rawName.replace(/-([a-z])/g, (_, letter) => letter.toUpperCase());
     if (inlineValue !== undefined) {
       flags[name] = inlineValue;
@@ -57,6 +60,7 @@ Claude Desktop 简体中文非侵入式汉化启动器
   node ./bin/claude-cn.mjs detect
   node ./bin/claude-cn.mjs audit [--write-template]
   node ./bin/claude-cn.mjs models [--include-non-chat-models] [--no-model-probe]
+  node ./bin/claude-cn.mjs models --gateway-base-url <url> --gateway-api-key <key> --models <model1,model2>
   node ./bin/claude-cn.mjs launch [--profile profiles/zh-CN.json] [--no-stop] [--no-shortcut]
   node ./bin/claude-cn.mjs attach --port 9229
 
@@ -181,6 +185,10 @@ function resolveLocale(profile, flags = {}) {
 
 function shouldOverrideLocale(profile, flags = {}) {
   return Boolean(flags.locale || flags.lang || profile.localeOverride);
+}
+
+function optionalFlagValue(value) {
+  return value && value !== true ? value : undefined;
 }
 
 function powershellString(value) {
@@ -395,7 +403,13 @@ async function runMsixPortableLaunch(app, flags) {
     await runModelSync({
       includeNonChatModels: flags.includeNonChatModels,
       noModelProbe: flags.noModelProbe,
-      modelProbeLimit: flags.modelProbeLimit
+      modelProbeLimit: flags.modelProbeLimit,
+      gatewayTimeoutMs: flags.gatewayTimeoutMs,
+      models: flags.models ?? flags.model,
+      gatewayBaseUrl: flags.gatewayBaseUrl,
+      gatewayApiKey: flags.gatewayApiKey,
+      gatewayAuthScheme: flags.gatewayAuthScheme,
+      inferenceProvider: flags.inferenceProvider
     });
   }
 
@@ -404,7 +418,11 @@ async function runMsixPortableLaunch(app, flags) {
   logger.info(`运行时图标已写入：${runtime.iconStats.patched} 个入口。`);
   logger.info(`中文资源已写入：${runtime.localeStats.translated}/${runtime.localeStats.total} 条。`);
   logger.info(`原生语言设置已加入中文：${runtime.nativeLanguageStats.patched} 个入口。`);
-  logger.info(`Max 思考档位增强已写入：${runtime.effortStats.patched} 个入口。`);
+  if (runtime.effortStats.patched > 0) {
+    logger.info(`Max 思考档位增强已写入：${runtime.effortStats.patched} 个入口（${runtime.effortStats.rules?.join(", ") || "legacy"}）。`);
+  } else {
+    logger.warn("Max 思考档位增强未命中当前 Claude 资源；请把 claude-cn-runtime.json 发给开发者排查。");
+  }
   logger.info(`便携兼容增强已写入：${runtime.compatibilityStats.patched} 个入口。`);
   logger.info(`主进程汉化注入已写入：${runtime.mainProcessStats.patched} 个入口。`);
   logger.info(`预加载汉化脚本已写入：${runtime.preloadStats.patched} 个入口。`);
@@ -431,13 +449,22 @@ async function runModelSync(flags = {}) {
     const modelProbeLimit = flags.modelProbeLimit && flags.modelProbeLimit !== true
       ? Number(flags.modelProbeLimit)
       : undefined;
+    const gatewayTimeoutMs = flags.gatewayTimeoutMs && flags.gatewayTimeoutMs !== true
+      ? Number(flags.gatewayTimeoutMs)
+      : undefined;
     const result = await syncThirdPartyModels({
       includeNonChatModels: Boolean(flags.includeNonChatModels),
       probeModels: !flags.noModelProbe,
-      modelProbeLimit
+      modelProbeLimit,
+      gatewayTimeoutMs,
+      models: optionalFlagValue(flags.models ?? flags.model),
+      gatewayBaseUrl: optionalFlagValue(flags.gatewayBaseUrl),
+      gatewayApiKey: optionalFlagValue(flags.gatewayApiKey),
+      gatewayAuthScheme: optionalFlagValue(flags.gatewayAuthScheme),
+      inferenceProvider: optionalFlagValue(flags.inferenceProvider)
     });
     if (result.modelCount > 0) {
-      logger.info(`第三方模型已同步：${result.modelCount} 个（provider: ${result.provider || "unknown"}）。`);
+      logger.info(`第三方模型已同步：${result.modelCount} 个（provider: ${result.provider || "unknown"}，${result.changed ? "已更新" : "已是最新"}）。`);
       if (result.verifiedModel) {
         logger.info(`网关健康检查模型已优先使用：${result.verifiedModel}`);
       } else if (result.probeSkipped === "missing-static-gateway-credential") {
@@ -448,9 +475,23 @@ async function runModelSync(flags = {}) {
         const failedModels = result.probeFailures.map((failure) => failure.model).filter(Boolean).join(", ");
         logger.warn(`模型连通性探测未找到可用模型：${failedModels || "unknown"}`);
       }
+      if (result.fetchError) {
+        logger.warn(`读取 Gateway /v1/models 失败，已使用现有/手动模型列表：${result.fetchError}`);
+      }
       logger.info(`配置文件：${result.configPath}`);
     } else {
-      logger.warn("没有同步到第三方模型；请检查 Claude-3p Gateway 配置。");
+      logger.warn("没有同步到第三方模型；那台电脑还没有可用的 Claude-3p Gateway 模型配置。");
+      logger.info(`配置文件：${result.configPath}`);
+      if (!result.configExists) {
+        logger.warn("未发现 Claude-3p 配置文件；需要先在开发者模式里配置第三方推理，或用命令写入。");
+      }
+      if (result.missingFields?.length > 0) {
+        logger.warn(`缺少配置项：${result.missingFields.join(", ")}`);
+      }
+      if (result.fetchError) {
+        logger.warn(`读取 Gateway /v1/models 失败：${result.fetchError}`);
+      }
+      logger.info("可在目标电脑运行：ClaudeCN.exe models --gateway-base-url <url> --gateway-api-key <key> --models <model1,model2>");
     }
     return result;
   } catch (error) {

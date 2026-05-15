@@ -78,6 +78,86 @@ function gatewayBaseUrl(config) {
   return String(config.inferenceGatewayBaseUrl || "").replace(/\/+$/, "");
 }
 
+function parseModelList(value) {
+  if (Array.isArray(value)) {
+    return value.flatMap(parseModelList);
+  }
+  if (typeof value !== "string") {
+    return [];
+  }
+
+  return value
+    .split(/[\n,;]+/g)
+    .map((model) => model.trim())
+    .filter(Boolean);
+}
+
+function firstNonEmpty(...values) {
+  return values.find((value) => typeof value === "string" && value.trim());
+}
+
+function configOverridesFromOptions(options = {}) {
+  const gatewayBaseUrl = firstNonEmpty(
+    options.gatewayBaseUrl,
+    process.env.CLAUDE_ULTRA_GATEWAY_BASE_URL,
+    process.env.CLAUDE_3P_GATEWAY_BASE_URL
+  );
+  const gatewayApiKey = firstNonEmpty(
+    options.gatewayApiKey,
+    process.env.CLAUDE_ULTRA_GATEWAY_API_KEY,
+    process.env.CLAUDE_3P_GATEWAY_API_KEY
+  );
+  const gatewayAuthScheme = firstNonEmpty(
+    options.gatewayAuthScheme,
+    process.env.CLAUDE_ULTRA_GATEWAY_AUTH_SCHEME,
+    process.env.CLAUDE_3P_GATEWAY_AUTH_SCHEME
+  );
+  const inferenceProvider = firstNonEmpty(
+    options.inferenceProvider,
+    gatewayBaseUrl ? "gateway" : null
+  );
+  const overrides = {};
+
+  if (inferenceProvider) {
+    overrides.inferenceProvider = inferenceProvider;
+  }
+  if (gatewayBaseUrl) {
+    overrides.inferenceGatewayBaseUrl = gatewayBaseUrl;
+  }
+  if (gatewayApiKey) {
+    overrides.inferenceGatewayApiKey = gatewayApiKey;
+  }
+  if (gatewayAuthScheme) {
+    overrides.inferenceGatewayAuthScheme = gatewayAuthScheme;
+  }
+
+  return overrides;
+}
+
+function diagnoseConfig(config, paths, configExists) {
+  const missingFields = [];
+  if (config.inferenceProvider !== "gateway") {
+    missingFields.push("inferenceProvider=gateway");
+  }
+  if (!config.inferenceGatewayBaseUrl) {
+    missingFields.push("inferenceGatewayBaseUrl");
+  }
+  if (!config.inferenceGatewayApiKey && config.inferenceGatewayAuthScheme !== "sso") {
+    missingFields.push("inferenceGatewayApiKey");
+  }
+
+  return {
+    rootDir: paths.rootDir,
+    libraryDir: paths.libraryDir,
+    metaPath: paths.metaPath,
+    appliedId: paths.appliedId,
+    configExists,
+    metaExists: Boolean(paths.meta),
+    entryCount: Array.isArray(paths.meta?.entries) ? paths.meta.entries.length : 0,
+    missingFields
+  };
+}
+
 function normalizeModels(payload) {
   const rawModels = Array.isArray(payload?.data)
     ? payload.data
@@ -145,8 +225,10 @@ async function fetchGatewayModels(config, options = {}) {
   }
 
   const baseUrl = gatewayBaseUrl(config);
+  const timeoutMs = Number(options.gatewayTimeoutMs) || 8000;
   const response = await fetch(`${baseUrl}/v1/models`, {
-    headers: gatewayHeaders(config)
+    headers: gatewayHeaders(config),
+    signal: AbortSignal.timeout(timeoutMs)
   });
   if (!response.ok) {
     throw new Error(`Gateway /v1/models 返回 ${response.status} ${response.statusText}`);
@@ -259,13 +341,31 @@ function modelEntry(model) {
 
 export async function syncThirdPartyModels(options = {}) {
   const paths = await getAppliedConfigPath(options.rootDir);
+  const configExists = await pathExists(paths.configPath);
   let config = {};
-  if (await pathExists(paths.configPath)) {
+  if (configExists) {
     config = await readJson(paths.configPath);
   }
+  config = {
+    ...config,
+    ...configOverridesFromOptions(options)
+  };
+  const diagnostic = diagnoseConfig(config, paths, configExists);
 
-  const fetchedModels = await fetchGatewayModels(config, options);
-  const requestedModels = Array.isArray(options.models) ? options.models : [];
+  let fetchedModels = [];
+  let fetchError = null;
+  try {
+    fetchedModels = await fetchGatewayModels(config, options);
+  } catch (error) {
+    fetchError = error instanceof Error ? error.message : String(error);
+  }
+
+  const requestedModels = parseModelList(
+    options.models
+      ?? options.model
+      ?? process.env.CLAUDE_ULTRA_MODELS
+      ?? process.env.CLAUDE_3P_MODELS
+  );
   const existingModels = configuredModelNames(config);
   const discoveredModels = [...new Set([...requestedModels, ...fetchedModels, ...existingModels])].filter(Boolean);
   const orderedModels = orderModelsForGateway(discoveredModels);
@@ -284,7 +384,9 @@ export async function syncThirdPartyModels(options = {}) {
       models: [],
       verifiedModel: null,
       probeSkipped: probeResult.skipped || null,
-      probeFailures: probeResult.failures || []
+      probeFailures: probeResult.failures || [],
+      fetchError,
+      ...diagnostic
     };
   }
 
@@ -311,6 +413,8 @@ export async function syncThirdPartyModels(options = {}) {
     models,
     verifiedModel: probeResult.model || null,
     probeSkipped: probeResult.skipped || null,
-    probeFailures: probeResult.failures || []
+    probeFailures: probeResult.failures || [],
+    fetchError,
+    ...diagnostic
   };
 }

@@ -625,37 +625,97 @@ async function findJavaScriptFiles(rootPath) {
   return files;
 }
 
+function replaceWithCount(content, pattern, replacement) {
+  let count = 0;
+  const nextContent = content.replace(pattern, (...args) => {
+    count += 1;
+    return typeof replacement === "function" ? replacement(...args) : replacement;
+  });
+
+  return { content: nextContent, count };
+}
+
+function applyMaxEffortPatchRules(content) {
+  const matchedRules = [];
+  const stringRules = [
+    {
+      name: "legacy-max-support",
+      needle: 'return!(!s.includes("opus-4-6")&&!s.includes("opus-4-7"))||!!t&&!(s.includes("haiku")||s.includes("sonnet")||s.includes("opus"))',
+      replacement: "return!0"
+    },
+    {
+      name: "legacy-model-menu-section",
+      needle: 'items:O.numberedModelItems,extraSections:$,disabled:0===n.length||o',
+      replacement: 'items:iM,extraSections:[...($??iM),{key:"models",header:N.formatMessage({defaultMessage:"Models",id:"blWvagsLt7"}),items:O.numberedModelItems}],disabled:0===n.length||o'
+    }
+  ];
+  const regexRules = [
+    {
+      name: "current-max-support-return",
+      pattern: /return!\(!([A-Za-z_$][\w$]*)\.includes\("opus-4-6"\)&&!\1\.includes\("opus-4-7"\)\)\|\|!\(\1\.includes\("haiku"\)\|\|\1\.includes\("sonnet"\)\|\|\1\.includes\("opus"\)\)/g,
+      replacement: "return!0"
+    },
+    {
+      name: "current-effort-options-filter",
+      pattern: /const ([A-Za-z_$][\w$]*)=([A-Za-z_$][\w$]*)\.filter\(([A-Za-z_$][\w$]*)=>\("max"!==\3\|\|([A-Za-z_$][\w$]*)\)&&\("xhigh"!==\3\|\|([A-Za-z_$][\w$]*)\)\)/g,
+      replacement: 'const $1=$2.filter($3=>("xhigh"!==$3||$5))'
+    },
+    {
+      name: "current-stored-max-downgrade",
+      pattern: /([A-Za-z_$][\w$]*)="max"===([A-Za-z_$][\w$]*)&&!([A-Za-z_$][\w$]*)\|\|"xhigh"===\2&&!([A-Za-z_$][\w$]*)\?"high":\2/g,
+      replacement: '$1="xhigh"===$2&&!$4?"high":$2'
+    },
+    {
+      name: "current-session-max-downgrade",
+      pattern: /([A-Za-z_$][\w$]*)=([A-Za-z_$][\w$]*)\.success\?"max"===\2\.data&&!([A-Za-z_$][\w$]*)\|\|"xhigh"===\2\.data&&!([A-Za-z_$][\w$]*)\?"high":\2\.data:void 0/g,
+      replacement: '$1=$2.success?"xhigh"===$2.data&&!$4?"high":$2.data:void 0'
+    }
+  ];
+
+  let nextContent = content;
+
+  for (const rule of stringRules) {
+    if (nextContent.includes(rule.needle)) {
+      nextContent = nextContent.replace(rule.needle, rule.replacement);
+      matchedRules.push(rule.name);
+    }
+  }
+
+  for (const rule of regexRules) {
+    const result = replaceWithCount(nextContent, rule.pattern, rule.replacement);
+    if (result.count > 0) {
+      nextContent = result.content;
+      matchedRules.push(rule.name);
+    }
+  }
+
+  return {
+    content: nextContent,
+    matchedRules,
+    changed: nextContent !== content
+  };
+}
+
 async function patchMaxEffortSupport(resourcesDir) {
   const ionDistDir = path.join(resourcesDir, "ion-dist");
   if (!(await pathExists(ionDistDir))) {
-    return { patched: 0 };
+    return { patched: 0, rules: [] };
   }
 
-  const replacements = [
-    [
-      'return!(!s.includes("opus-4-6")&&!s.includes("opus-4-7"))||!!t&&!(s.includes("haiku")||s.includes("sonnet")||s.includes("opus"))',
-      'return!(!s.includes("opus-4-6")&&!s.includes("opus-4-7"))||!(s.includes("haiku")||s.includes("sonnet")||s.includes("opus"))'
-    ],
-    [
-      'items:O.numberedModelItems,extraSections:$,disabled:0===n.length||o',
-      'items:iM,extraSections:[...($??iM),{key:"models",header:N.formatMessage({defaultMessage:"Models",id:"blWvagsLt7"}),items:O.numberedModelItems}],disabled:0===n.length||o'
-    ]
-  ];
   let patched = 0;
+  const matchedRules = new Set();
 
   for (const filePath of await findJavaScriptFiles(ionDistDir)) {
     let content = await fs.readFile(filePath, "utf8");
+    const result = applyMaxEffortPatchRules(content);
 
-    let changed = false;
-    for (const [needle, replacement] of replacements) {
-      if (content.includes(needle)) {
-        content = content.replace(needle, replacement);
-        changed = true;
-      }
+    if (!result.changed) {
+      continue;
     }
 
-    if (!changed) {
-      continue;
+    content = result.content;
+    for (const ruleName of result.matchedRules) {
+      matchedRules.add(ruleName);
     }
 
     if (!content.includes(ULTRA_MAX_EFFORT_PATCH_MARKER)) {
@@ -666,7 +726,7 @@ async function patchMaxEffortSupport(resourcesDir) {
     patched += 1;
   }
 
-  return { patched };
+  return { patched, rules: [...matchedRules] };
 }
 
 function tryPatchSupportedLocaleArray(content, locale) {
