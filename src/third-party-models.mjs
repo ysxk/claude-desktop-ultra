@@ -1,4 +1,5 @@
 import fs from "node:fs/promises";
+import crypto from "node:crypto";
 import path from "node:path";
 
 async function pathExists(filePath) {
@@ -11,12 +12,17 @@ async function pathExists(filePath) {
 }
 
 async function readJson(filePath) {
-  return JSON.parse(await fs.readFile(filePath, "utf8"));
+  const content = await fs.readFile(filePath, "utf8");
+  return JSON.parse(content.replace(/^\uFEFF/, ""));
 }
 
 async function writeJson(filePath, value) {
   await fs.mkdir(path.dirname(filePath), { recursive: true });
   await fs.writeFile(filePath, `${JSON.stringify(value, null, 2)}\n`, "utf8");
+}
+
+function isUuid(value) {
+  return typeof value === "string" && /^[a-f0-9-]{36}$/i.test(value);
 }
 
 function timestamp() {
@@ -37,9 +43,63 @@ async function getAppliedConfigPath(rootDir = claude3pRoot()) {
     meta = await readJson(metaPath);
   }
 
-  const appliedId = meta?.appliedId || "default";
+  const appliedId = isUuid(meta?.appliedId) ? meta.appliedId : crypto.randomUUID();
   const configPath = path.join(libraryDir, `${appliedId}.json`);
-  return { rootDir, libraryDir, metaPath, configPath, appliedId, meta };
+  const legacyConfigPath = path.join(libraryDir, "default.json");
+  return { rootDir, libraryDir, metaPath, configPath, legacyConfigPath, appliedId, meta };
+}
+
+async function ensureAppliedMeta(paths) {
+  const entryName = "Claude Desktop Ultra";
+  const entries = Array.isArray(paths.meta?.entries)
+    ? paths.meta.entries.filter((entry) => entry && isUuid(entry.id))
+    : [];
+  const hasAppliedEntry = entries.some((entry) => entry.id === paths.appliedId);
+  const nextMeta = {
+    ...paths.meta,
+    appliedId: paths.appliedId,
+    entries: hasAppliedEntry ? entries : [...entries, { id: paths.appliedId, name: entryName }]
+  };
+  const previous = JSON.stringify(paths.meta || {});
+  const next = JSON.stringify(nextMeta);
+  if (previous !== next) {
+    await writeJson(paths.metaPath, nextMeta);
+  }
+  paths.meta = nextMeta;
+  return { changed: previous !== next, meta: nextMeta };
+}
+
+async function ensureDeploymentMode(rootDir) {
+  const configPath = path.join(rootDir, "claude_desktop_config.json");
+  let config = {};
+  const existed = await pathExists(configPath);
+  if (existed) {
+    try {
+      config = await readJson(configPath);
+    } catch {
+      config = {};
+    }
+  }
+
+  const nextConfig = {
+    ...config,
+    deploymentMode: "3p"
+  };
+  const previous = JSON.stringify(config);
+  const next = JSON.stringify(nextConfig);
+  if (previous !== next && existed) {
+    await fs.copyFile(configPath, `${configPath}.bak-${timestamp()}`);
+  }
+  if (previous !== next) {
+    await writeJson(configPath, nextConfig);
+  }
+
+  return {
+    path: configPath,
+    changed: previous !== next,
+    previousMode: config.deploymentMode || null,
+    mode: nextConfig.deploymentMode
+  };
 }
 
 function authHeaders(config) {
@@ -134,7 +194,7 @@ function configOverridesFromOptions(options = {}) {
   return overrides;
 }
 
-function diagnoseConfig(config, paths, configExists) {
+function diagnoseConfig(config, paths, configExists, legacyConfigMigrated) {
   const missingFields = [];
   if (config.inferenceProvider !== "gateway") {
     missingFields.push("inferenceProvider=gateway");
@@ -152,7 +212,10 @@ function diagnoseConfig(config, paths, configExists) {
     metaPath: paths.metaPath,
     appliedId: paths.appliedId,
     configExists,
+    legacyConfigPath: paths.legacyConfigPath,
+    legacyConfigMigrated,
     metaExists: Boolean(paths.meta),
+    validAppliedId: isUuid(paths.meta?.appliedId),
     entryCount: Array.isArray(paths.meta?.entries) ? paths.meta.entries.length : 0,
     missingFields
   };
@@ -341,16 +404,23 @@ function modelEntry(model) {
 
 export async function syncThirdPartyModels(options = {}) {
   const paths = await getAppliedConfigPath(options.rootDir);
+  const metaResult = await ensureAppliedMeta(paths);
+  const deploymentMode = await ensureDeploymentMode(paths.rootDir);
   const configExists = await pathExists(paths.configPath);
+  const legacyConfigExists = !configExists && await pathExists(paths.legacyConfigPath);
+  let legacyConfigMigrated = false;
   let config = {};
   if (configExists) {
     config = await readJson(paths.configPath);
+  } else if (legacyConfigExists) {
+    config = await readJson(paths.legacyConfigPath);
+    legacyConfigMigrated = true;
   }
   config = {
     ...config,
     ...configOverridesFromOptions(options)
   };
-  const diagnostic = diagnoseConfig(config, paths, configExists);
+  const diagnostic = diagnoseConfig(config, paths, configExists || legacyConfigMigrated, legacyConfigMigrated);
 
   let fetchedModels = [];
   let fetchError = null;
@@ -386,6 +456,8 @@ export async function syncThirdPartyModels(options = {}) {
       probeSkipped: probeResult.skipped || null,
       probeFailures: probeResult.failures || [],
       fetchError,
+      metaChanged: metaResult.changed,
+      deploymentMode,
       ...diagnostic
     };
   }
@@ -398,15 +470,16 @@ export async function syncThirdPartyModels(options = {}) {
 
   const previous = JSON.stringify(config);
   const next = JSON.stringify(nextConfig);
-  if (previous !== next && await pathExists(paths.configPath)) {
+  const shouldWriteConfig = previous !== next || legacyConfigMigrated || !(await pathExists(paths.configPath));
+  if (shouldWriteConfig && await pathExists(paths.configPath)) {
     await fs.copyFile(paths.configPath, `${paths.configPath}.bak-${timestamp()}`);
   }
-  if (previous !== next) {
+  if (shouldWriteConfig) {
     await writeJson(paths.configPath, nextConfig);
   }
 
   return {
-    changed: previous !== next,
+    changed: shouldWriteConfig,
     configPath: paths.configPath,
     provider: nextConfig.inferenceProvider,
     modelCount: models.length,
@@ -415,6 +488,8 @@ export async function syncThirdPartyModels(options = {}) {
     probeSkipped: probeResult.skipped || null,
     probeFailures: probeResult.failures || [],
     fetchError,
+    metaChanged: metaResult.changed,
+    deploymentMode,
     ...diagnostic
   };
 }

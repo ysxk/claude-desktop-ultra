@@ -478,10 +478,22 @@ async function runModelSync(flags = {}) {
       if (result.fetchError) {
         logger.warn(`读取 Gateway /v1/models 失败，已使用现有/手动模型列表：${result.fetchError}`);
       }
+      if (result.metaChanged) {
+        logger.info(`已创建 / 修复 Claude-3p 配置索引：${result.metaPath}`);
+      }
+      if (result.legacyConfigMigrated) {
+        logger.info(`已迁移旧版默认配置：${result.legacyConfigPath}`);
+      }
+      if (result.deploymentMode?.changed) {
+        logger.info(`已切换 Claude 第三方推理模式：${result.deploymentMode.path}`);
+      }
       logger.info(`配置文件：${result.configPath}`);
     } else {
       logger.warn("没有同步到第三方模型；那台电脑还没有可用的 Claude-3p Gateway 模型配置。");
       logger.info(`配置文件：${result.configPath}`);
+      logger.info(`配置索引：${result.metaPath}`);
+      logger.info(`旧版默认配置：${result.legacyConfigPath}`);
+      logger.info(`第三方推理模式文件：${result.deploymentMode?.path}`);
       if (!result.configExists) {
         logger.warn("未发现 Claude-3p 配置文件；需要先在开发者模式里配置第三方推理，或用命令写入。");
       }

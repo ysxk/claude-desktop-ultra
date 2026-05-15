@@ -13,6 +13,8 @@ Claude Desktop Ultra 是一个 Claude Desktop 增强器。它通过非侵入式�
 - 第三方模型解锁：同步 Claude-3p Gateway 的 `/v1/models` 到 Claude-3p 配置，写入 `inferenceModels` 并关闭模型校验限制，让 Claude 显示非官方模型。
 - 跨机器网关兼容：启动时会把更可能可用的第三方模型排到第一位，并在存在静态 Gateway API Key 时探测可用模型，避免 Claude 健康检查误选无权限的 Sonnet / Haiku / Opus。
 - 模型同步诊断：如果目标电脑没有 Claude-3p Gateway 配置，会输出缺失项、配置文件路径和可直接运行的修复命令。
+- 空白机器 3P 初始化：首次写入第三方模型时会自动创建 Claude 认可的 `configLibrary/_meta.json`，并把 `deploymentMode` 切到 `3p`。
+- 旧版配置迁移：如果之前版本写过 `configLibrary/default.json`，新版会迁移到 Claude 真正读取的 UUID 配置文件。
 - 思考档位增强：在模型思考值菜单中加入 `Max` 选项，并兼容新版 Claude 对 `modelSupportsMaxEffort` 的隐藏逻辑。
 - Cowork 便携兼容：绕过 Ultra 便携运行时触发的 MSIX 安装来源误判；如果系统缺少虚拟机平台 / HCS 服务，仍会保留真实系统提示。
 - 彩色应用图标：启动的 `ClaudeCNRuntime.exe` 会写入 Claude 官方彩色图标，避免任务栏显示空白或黑色托盘图标。
@@ -108,7 +110,7 @@ $env:CLAUDE_ULTRA_MODELS="gpt-4o,gemini-2.5-pro,deepseek-chat"
 
 ## 常见问题
 
-- 别的电脑没有解锁模型：通常是那台电脑没有 Claude-3p Gateway 配置，或 `/v1/models` 读取失败。先运行 `.\dist\ClaudeCN.exe models`，看输出的缺失项和配置路径。
+- 别的电脑没有解锁模型：通常是那台电脑没有 Claude-3p Gateway 配置、`configLibrary/_meta.json` 缺失，或 `/v1/models` 读取失败。先运行 `.\dist\ClaudeCN.exe models --gateway-base-url "网关地址" --gateway-api-key "Key" --models "gpt-4o"`，新版会自动修复配置索引并切到 3P 模式。
 - 别的电脑没有 `Max` 思考值：请运行新版 exe，启动日志里应出现 `Max 思考档位增强已写入`，同时 `claude-cn-runtime.json` 里的 `effortStats.rules` 不应为空。
 - 别的电脑提示 `Gateway returned an error`：通常是网关健康检查选到了该账号无权限 / 无额度的模型。新版会优先选择可用第三方模型；仍失败时，打开“开发者模式 → 配置第三方推理”，把模型列表第一项改成网关实际能调用的模型。
 - 别的电脑提示 `Reinstall required`：这是 Claude 对便携运行时的安装来源检测。Ultra 已绕过 MSIX 来源误判；如果仍提示，请确认目标电脑安装的是 Microsoft Store / MSIX 版 Claude Desktop，并重新运行新版 exe。
