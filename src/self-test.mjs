@@ -8,7 +8,12 @@ import { promisify } from "node:util";
 import { detectClaude } from "./adapters/claude-desktop.mjs";
 import { buildInjectionSource } from "./injection-source.mjs";
 import { loadProfile } from "./locale.mjs";
-import { applyMaxEffortPatchRules, prepareMacPortableRuntime, preparePortableRuntime } from "./portable-runtime.mjs";
+import {
+  applyMaxEffortPatchRules,
+  patchUltraLocalBridge,
+  prepareMacPortableRuntime,
+  preparePortableRuntime
+} from "./portable-runtime.mjs";
 import { syncThirdPartyModels } from "./third-party-models.mjs";
 
 const TEST_MODEL = "deepseek-v4-flash";
@@ -104,18 +109,19 @@ async function verifyMacCodeSignature(appPath) {
   }
 }
 
-async function startFakeGateway() {
+async function startFakeGateway({
+  models = [
+    { id: "claude-3-5-sonnet" },
+    { id: TEST_MODEL },
+    { id: "text-embedding-3-large" }
+  ],
+  workingModel = TEST_MODEL
+} = {}) {
   const requests = [];
   const server = http.createServer(async (request, response) => {
     if (request.url === "/v1/models") {
       response.writeHead(200, { "content-type": "application/json" });
-      response.end(JSON.stringify({
-        data: [
-          { id: "claude-3-5-sonnet" },
-          { id: TEST_MODEL },
-          { id: "text-embedding-3-large" }
-        ]
-      }));
+      response.end(JSON.stringify({ data: models }));
       return;
     }
 
@@ -130,7 +136,7 @@ async function startFakeGateway() {
         model: payload.model || null
       });
 
-      if (payload.model === TEST_MODEL) {
+      if (payload.model === workingModel) {
         response.writeHead(200, { "content-type": "application/json" });
         response.end(JSON.stringify({
           id: "msg_self_test",
@@ -259,6 +265,57 @@ async function testLegacyModelMigration(recorder, gateway) {
   }
 }
 
+async function testGatewayModelRefreshReplacesStaleModels(recorder) {
+  const gateway = await startFakeGateway({
+    models: [
+      { id: "gpt-new-chat" },
+      { id: "qwen-new-chat" },
+      { id: "text-embedding-3-large" }
+    ]
+  });
+  const rootDir = await makeTempDir("claude-ultra-refresh-");
+  try {
+    const appliedId = "11111111-1111-4111-8111-111111111111";
+    const libraryDir = path.join(rootDir, "configLibrary");
+    await fs.mkdir(libraryDir, { recursive: true });
+    await fs.writeFile(
+      path.join(libraryDir, "_meta.json"),
+      `${JSON.stringify({
+        appliedId,
+        entries: [{ id: appliedId, name: "Claude ultra" }]
+      }, null, 2)}\n`,
+      "utf8"
+    );
+    await fs.writeFile(
+      path.join(libraryDir, `${appliedId}.json`),
+      `${JSON.stringify({
+        inferenceProvider: "gateway",
+        inferenceGatewayBaseUrl: "http://127.0.0.1:1",
+        inferenceGatewayApiKey: "old-key",
+        inferenceModels: [{ name: "old-site-only", labelOverride: "Old Site Only" }],
+        unstableDisableModelVerification: true
+      }, null, 2)}\n`,
+      "utf8"
+    );
+
+    await syncThirdPartyModels({
+      rootDir,
+      gatewayBaseUrl: gateway.baseUrl,
+      gatewayApiKey: "new-key",
+      probeModels: false,
+      gatewayTimeoutMs: 2000
+    });
+    const config = await validateModelConfig(rootDir);
+    const modelNames = config.config.inferenceModels?.map((model) => model.name) || [];
+
+    recorder.check("新 Gateway 模型会替换旧模型列表", modelNames.includes("gpt-new-chat") && modelNames.includes("qwen-new-chat"), modelNames.join(", "));
+    recorder.check("旧 Gateway 独有模型会被删除", !modelNames.includes("old-site-only"), modelNames.join(", "));
+  } finally {
+    await gateway.close();
+    await fs.rm(rootDir, { recursive: true, force: true });
+  }
+}
+
 async function testEmptyConfigDoesNotActivate(recorder) {
   const rootDir = await makeTempDir("claude-ultra-empty-");
   try {
@@ -303,6 +360,291 @@ function testInjectionSkipsEditableText(recorder) {
     source.includes("shouldAdoptCurrentValue")
       && source.includes("current !== original && current !== renderedOriginal")
   );
+}
+
+function testUltraRuntimeApi(recorder) {
+  const source = buildInjectionSource({
+    dictionary: {},
+    profile: {
+      locale: "zh-CN",
+      fallbackLocale: "en-US",
+      translateAttributes: [],
+      skipTextSelectors: []
+    },
+    launchLocale: "zh-CN",
+    localeOverride: true
+  });
+
+  const storage = new Map();
+  class TestElement {
+    nodeType = 1;
+    lang = "";
+    childElementCount = 0;
+    tagName = "HTML";
+    setAttribute() {}
+    hasAttribute() {
+      return false;
+    }
+    getAttribute() {
+      return null;
+    }
+    closest() {
+      return null;
+    }
+  }
+  class TestHTMLElement extends TestElement {}
+  class TestInputElement extends TestHTMLElement {
+    type = "text";
+    value = "";
+  }
+  class TestTextAreaElement extends TestHTMLElement {}
+  const documentElement = new TestElement();
+  const documentStub = {
+    readyState: "complete",
+    documentElement,
+    body: null,
+    title: "",
+    querySelectorAll: () => [],
+    getElementById: () => null,
+    createTreeWalker: () => ({ nextNode: () => null }),
+    addEventListener() {}
+  };
+  const previous = {
+    window: globalThis.window,
+    document: globalThis.document,
+    location: globalThis.location,
+    history: globalThis.history,
+    addEventListener: globalThis.addEventListener,
+    fetch: globalThis.fetch,
+    setTimeout: globalThis.setTimeout,
+    clearTimeout: globalThis.clearTimeout,
+    MutationObserver: globalThis.MutationObserver,
+    Node: globalThis.Node,
+    NodeFilter: globalThis.NodeFilter,
+    Element: globalThis.Element,
+    HTMLElement: globalThis.HTMLElement,
+    HTMLInputElement: globalThis.HTMLInputElement,
+    HTMLTextAreaElement: globalThis.HTMLTextAreaElement,
+    localStorageDescriptor: Object.getOwnPropertyDescriptor(globalThis, "localStorage")
+  };
+
+  try {
+    globalThis.window = globalThis;
+    globalThis.document = documentStub;
+    Object.defineProperty(globalThis, "localStorage", {
+      configurable: true,
+      value: {
+      getItem: (key) => storage.get(key) ?? null,
+      setItem: (key, value) => storage.set(key, String(value))
+      }
+    });
+    globalThis.location = { href: "https://claude.ai/" };
+    globalThis.history = {
+      pushState() {},
+      replaceState() {}
+    };
+    globalThis.addEventListener = () => {};
+    globalThis.fetch = () => Promise.resolve(new Response("{}"));
+    globalThis.setTimeout = (callback) => {
+      if (typeof callback === "function") {
+        callback();
+      }
+      return 0;
+    };
+    globalThis.clearTimeout = () => {};
+    globalThis.MutationObserver = class {
+      observe() {}
+    };
+    globalThis.Node = {
+      TEXT_NODE: 3,
+      ELEMENT_NODE: 1,
+      DOCUMENT_NODE: 9,
+      DOCUMENT_FRAGMENT_NODE: 11
+    };
+    globalThis.NodeFilter = {
+      SHOW_ELEMENT: 1,
+      SHOW_TEXT: 4
+    };
+    globalThis.Element = TestElement;
+    globalThis.HTMLElement = TestHTMLElement;
+    globalThis.HTMLInputElement = TestInputElement;
+    globalThis.HTMLTextAreaElement = TestTextAreaElement;
+
+    new Function(source)();
+    const api = globalThis.__CLAUDE_ULTRA__;
+    recorder.check("Ultra API 已暴露", Boolean(api?.prepareMessagesRequestInit && api?.modelWithOneMillionContext));
+    recorder.check("1M 默认关闭时不改模型", api.modelWithOneMillionContext(TEST_MODEL) === TEST_MODEL);
+
+    storage.set("__claude_ultra_features__", JSON.stringify({ oneMillionContext: true }));
+    recorder.check("1M 开启后本地模型标记追加 [1m]", api.modelWithOneMillionContext(TEST_MODEL) === `${TEST_MODEL}[1m]`);
+    recorder.check("1M 不改 default 模型", api.modelWithOneMillionContext("default") === "default");
+
+    const localSession = api.prepareLocalSessionInfo({ model: TEST_MODEL, message: "hi" });
+    recorder.check("本地 session start 会携带 [1m] 标记", localSession.model === `${TEST_MODEL}[1m]`);
+
+    const init = api.prepareMessagesRequestInit("https://gateway.example/v1/messages", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        model: `${TEST_MODEL}[1m]`,
+        max_tokens: 1,
+        messages: [{ role: "user", content: "." }]
+      })
+    });
+    const payload = JSON.parse(init.body);
+    const headers = new Headers(init.headers);
+    recorder.check("Messages 请求会剥离 model 后缀", payload.model === TEST_MODEL);
+    recorder.check(
+      "Messages 请求会追加 1M beta header",
+      headers.get("anthropic-beta")?.split(",").map((value) => value.trim()).includes("context-1m-2025-08-07")
+    );
+  } finally {
+    delete globalThis.__CLAUDE_ULTRA__;
+    delete globalThis.__CLAUDE_ULTRA_PREPARE_MODEL__;
+    delete globalThis.__CLAUDE_ULTRA_PREPARE_LOCAL_SESSION__;
+    delete globalThis.__CLAUDE_ULTRA_PREPARE_MESSAGES_REQUEST__;
+    delete globalThis._cuM;
+    delete globalThis._cu1;
+    delete globalThis._uM;
+    delete globalThis._u1;
+    globalThis.window = previous.window;
+    globalThis.document = previous.document;
+    if (previous.localStorageDescriptor) {
+      Object.defineProperty(globalThis, "localStorage", previous.localStorageDescriptor);
+    } else {
+      delete globalThis.localStorage;
+    }
+    globalThis.location = previous.location;
+    globalThis.history = previous.history;
+    globalThis.addEventListener = previous.addEventListener;
+    globalThis.fetch = previous.fetch;
+    globalThis.setTimeout = previous.setTimeout;
+    globalThis.clearTimeout = previous.clearTimeout;
+    globalThis.MutationObserver = previous.MutationObserver;
+    globalThis.Node = previous.Node;
+    globalThis.NodeFilter = previous.NodeFilter;
+    globalThis.Element = previous.Element;
+    globalThis.HTMLElement = previous.HTMLElement;
+    globalThis.HTMLInputElement = previous.HTMLInputElement;
+    globalThis.HTMLTextAreaElement = previous.HTMLTextAreaElement;
+  }
+}
+
+function testUltraMenuI18n(recorder) {
+  const source = buildInjectionSource({
+    dictionary: {},
+    profile: {
+      locale: "zh-CN",
+      fallbackLocale: "en-US",
+      translateAttributes: [],
+      skipTextSelectors: []
+    },
+    launchLocale: "zh-CN",
+    localeOverride: true
+  });
+
+  recorder.check(
+    "Ultra 菜单包含中文 i18n 文案",
+    source.includes("1M 上下文") && source.includes("Ultra：已启用 1M 上下文")
+  );
+  recorder.check(
+    "Ultra 菜单保留英文 fallback 文案",
+    source.includes("1M context") && source.includes("Ultra: 1M context enabled")
+  );
+  recorder.check(
+    "Ultra 菜单文案跟随当前 locale",
+    source.includes("state.currentLocale || readCurrentLocale()") && source.includes('startsWith("zh")')
+  );
+}
+
+function testUltraMenuPrefersComposerAddButton(recorder) {
+  const runtimeSource = buildInjectionSource({
+    dictionary: {},
+    profile: {
+      locale: "zh-CN",
+      fallbackLocale: "en-US",
+      translateAttributes: [],
+      skipTextSelectors: []
+    },
+    launchLocale: "zh-CN",
+    localeOverride: true
+  });
+  const runtime = runtimeSource.match(/;\(([\s\S]+)\)\(/)?.[1] || "";
+  const source = runtime.slice(
+    runtime.indexOf("const findAttachmentButton"),
+    runtime.indexOf("const buttonBaseStyle")
+  );
+  const helperSource = [
+    "const buttonSelector = \"button,[role='button'],[role='combobox'],[aria-label],[title]\";",
+    "const exactAddButtonName = (name) => { const normalized = String(name || \"\").replace(/\\s+/g, \" \").trim(); return normalized === \"+\" || /(?:^|\\s)(?:add|添加)(?:\\s|$)/i.test(normalized); };",
+    "const permissionModeButtonName = (name) => (/accept edit|accept edits|接受编辑|permission|permissions|权限|计划模式|plan mode|bypass|ask/i.test(String(name || \"\")));",
+    "const rectCenterY = (rect) => rect.top + (rect.height / 2);",
+    "const sameButtonRow = (left, right) => Math.abs(rectCenterY(left) - rectCenterY(right)) <= Math.max(10, Math.min(left.height, right.height) * 0.7);",
+    "const isComposerTextbox = (element) => element?.isTextbox === true && Boolean(visibleRect(element));"
+  ].join("");
+  const factory = new Function("visibleRect", "buttonName", "return (() => {" + helperSource + source + "; return findAttachmentButton; })();");
+  const ultraMenuId = "claude-ultra-menu";
+  const ultraPanelId = "claude-ultra-panel";
+  const textbox = {
+    isTextbox: true,
+    rect: { width: 780, height: 46, top: 120, bottom: 166 },
+    getBoundingClientRect() {
+      return this.rect;
+    }
+  };
+
+  const buttons = [
+    { name: "本地", text: "本地", rect: { width: 54, height: 32, top: 52, bottom: 84, left: 0, right: 54 } },
+    { name: "选择文件夹…", text: "选择文件夹…", rect: { width: 104, height: 32, top: 52, bottom: 84, left: 62, right: 166 } },
+    { name: "接受编辑", text: "接受编辑", rect: { width: 68, height: 32, top: 182, bottom: 214, left: 0, right: 68 } },
+    { name: "Add", title: "Add attachments", text: "", rect: { width: 32, height: 32, top: 182, bottom: 214, left: 76, right: 108 } },
+    { name: "GLM 5 · Medium", text: "GLM 5 · Medium", rect: { width: 116, height: 32, top: 182, bottom: 214, left: 680, right: 796 } }
+  ];
+  for (const button of buttons) {
+    button.id = "";
+    button.closest = (selector) => selector === `#${ultraPanelId}` ? null : null;
+    button.getBoundingClientRect = () => button.rect;
+    button.querySelector = () => null;
+    button.getAttribute = (name) => {
+      if (name === "aria-label") {
+        return button.name;
+      }
+      if (name === "title") {
+        return button.title || null;
+      }
+      return null;
+    };
+    button.textContent = button.text;
+  }
+  const root = {
+    querySelectorAll: (selector) => selector === "button,[role='button'],[role='combobox'],[aria-label],[title]" ? buttons : [textbox]
+  };
+  const findAttachmentButton = factory(
+    (element) => element.rect,
+    (button) => [button.getAttribute("aria-label"), button.textContent].filter(Boolean).join(" ").trim()
+  );
+
+  globalThis.ultraMenuId = ultraMenuId;
+  globalThis.ultraPanelId = ultraPanelId;
+  recorder.check("Ultra 菜单优先挂到输入框下方 Add 按钮右侧", findAttachmentButton(root) === buttons[3]);
+  recorder.check(
+    "Ultra 菜单已存在时仍会移动到目标 Add 后方",
+    runtime.includes("root.previousElementSibling !== attachmentButton")
+      && runtime.includes('attachmentButton.insertAdjacentElement("afterend", root)')
+  );
+  delete globalThis.ultraMenuId;
+  delete globalThis.ultraPanelId;
+}
+
+function testUltraLocalBridgePatch(recorder) {
+  const fixture = [
+    'start(e){return abc.ipcRenderer.invoke("123_claude.web_$_LocalAgentModeSessions_$_start",e)}',
+    'setModel(e,A){return abc.ipcRenderer.invoke("123_claude.web_$_LocalAgentModeSessions_$_setModel",e,A)}'
+  ].join(";");
+  const patched = patchUltraLocalBridge(fixture);
+
+  recorder.check("Ultra bridge 会包装 start 入参", patched.includes("self._u1?.(e)||e"));
+  recorder.check("Ultra bridge 会包装 setModel 入参", patched.includes("self._uM?.(A)||A"));
 }
 
 function testMaxEffortPatchKeepsModelMenuPrimary(recorder) {
@@ -389,10 +731,15 @@ export async function runWindowsSelfTest({ rootDir, flags = {}, logger = console
   try {
     logger.info(`${testName}开始，测试模型：${TEST_MODEL}`);
     testInjectionSkipsEditableText(recorder);
+    testUltraRuntimeApi(recorder);
+    testUltraMenuI18n(recorder);
+    testUltraMenuPrefersComposerAddButton(recorder);
+    testUltraLocalBridgePatch(recorder);
     testMaxEffortPatchKeepsModelMenuPrimary(recorder);
     await testEmptyConfigDoesNotActivate(recorder);
     await testBlankModelSync(recorder, gateway);
     await testLegacyModelMigration(recorder, gateway);
+    await testGatewayModelRefreshReplacesStaleModels(recorder);
     if (!flags.skipRuntime) {
       await testPortableRuntime(recorder, rootDir, flags);
     }

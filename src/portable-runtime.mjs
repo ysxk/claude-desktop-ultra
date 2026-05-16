@@ -11,10 +11,10 @@ const ASAR_JSON_OFFSET = 16;
 const ASAR_HEADER_SIZE_OFFSET = 4;
 const ASAR_STRING_SIZE_OFFSET = 12;
 const PRELOAD_PATCH_MARKER = "CLAUDE_CN_PRELOAD_PATCH";
-const MAIN_PROCESS_PATCH_MARKER = "CLAUDE_CN_MAIN_PROCESS_PATCH_V7";
+const MAIN_PROCESS_PATCH_MARKER = "CLAUDE_CN_MAIN_PROCESS_PATCH_V8_ULTRA_MENU";
 const ULTRA_MAX_EFFORT_PATCH_MARKER = "CLAUDE_ULTRA_MAX_EFFORT_PATCH";
 const NATIVE_LANGUAGE_LIST_PATCH_MARKER = "CLAUDE_ULTRA_NATIVE_LANGUAGE_LIST_PATCH";
-const PORTABLE_COMPATIBILITY_PATCH_VERSION = 4;
+const PORTABLE_COMPATIBILITY_PATCH_VERSION = 5;
 const MAC_RUNTIME_APP_NAME = "Claude ultra";
 const MAC_RUNTIME_BUNDLE_IDENTIFIER = "com.claudeultra.runtime";
 const MAC_RUNTIME_IDENTITY_VERSION = 2;
@@ -48,7 +48,7 @@ function reusePreviousStats(current, previous) {
   return previous;
 }
 
-function isCompleteMacRuntimeStatus(status) {
+function isCompleteMacRuntimeStatus(status, expectedInjectionHash = null) {
   return Boolean(
     status?.localeStats?.translated > 0
       && status?.nativeLanguageStats?.patched > 0
@@ -63,6 +63,7 @@ function isCompleteMacRuntimeStatus(status) {
       && status?.asarIntegrityStats?.patched > 0
       && status?.signingStats?.signed === true
       && status?.mainProcessPatchMarker === MAIN_PROCESS_PATCH_MARKER
+      && (!expectedInjectionHash || status?.injectionHash === expectedInjectionHash)
   );
 }
 
@@ -919,6 +920,32 @@ function patchMacDesktopUserAgent(content) {
   );
 }
 
+export function patchUltraLocalBridge(content) {
+  let nextContent = content.replace(
+    /start\((\w+)\)\{return ([A-Za-z_$][\w$]*)\.ipcRenderer\.invoke\("([^"]+_claude\.web_\$_LocalAgentModeSessions_\$_start)",\1\)\}/g,
+    (_match, infoName, electronName, channelName) => (
+      `start(${infoName}){return ${electronName}.ipcRenderer.invoke("${channelName}",self._u1?.(${infoName})||${infoName})}`
+    )
+  );
+  nextContent = nextContent.replace(
+    /setModel\((\w+),(\w+)\)\{return ([A-Za-z_$][\w$]*)\.ipcRenderer\.invoke\("([^"]+_claude\.web_\$_LocalAgentModeSessions_\$_setModel)",\1,\2\)\}/g,
+    (_match, sessionName, modelName, electronName, channelName) => (
+      `setModel(${sessionName},${modelName}){return ${electronName}.ipcRenderer.invoke("${channelName}",${sessionName},self._uM?.(${modelName})||${modelName})}`
+    )
+  );
+  if (Buffer.byteLength(nextContent, "utf8") > Buffer.byteLength(content, "utf8")) {
+    const withoutSourceMap = nextContent.replace(/\n?\/\/# sourceMappingURL=[^\n]*\.map\s*$/, "");
+    if (Buffer.byteLength(withoutSourceMap, "utf8") <= Buffer.byteLength(content, "utf8")) {
+      return withoutSourceMap;
+    }
+    const withoutInjectedCss = withoutSourceMap.replace(/;[A-Za-z_$][\w$]*\|\|[A-Za-z_$][\w$]*\.webFrame\.insertCSS\(`[\s\S]*?`,\{cssOrigin:"author"\}\);?\s*$/, "");
+    if (Buffer.byteLength(withoutInjectedCss, "utf8") <= Buffer.byteLength(content, "utf8")) {
+      return withoutInjectedCss;
+    }
+  }
+  return nextContent;
+}
+
 async function patchPortableCompatibility(resourcesDir) {
   const asarPath = path.join(resourcesDir, "app.asar");
   if (!(await pathExists(asarPath))) {
@@ -928,7 +955,7 @@ async function patchPortableCompatibility(resourcesDir) {
   const result = await patchAsarFile(asarPath, [
     {
       file: ".vite/build/index.js",
-      transform: (content) => patchMacDesktopUserAgent(patchMacSharedConfigWrites(patchMacVirtualizationEntitlementCheck(patchCoworkMsixCheck(patchGatewayHealthModelSelector(content))))),
+      transform: (content) => patchUltraLocalBridge(patchMacDesktopUserAgent(patchMacSharedConfigWrites(patchMacVirtualizationEntitlementCheck(patchCoworkMsixCheck(patchGatewayHealthModelSelector(content)))))),
       inPlace: true
     },
     {
@@ -938,12 +965,12 @@ async function patchPortableCompatibility(resourcesDir) {
     },
     {
       file: ".vite/build/mainView.js",
-      transform: patchMacVirtualizationEntitlementCheck,
+      transform: (content) => patchUltraLocalBridge(patchMacVirtualizationEntitlementCheck(content)),
       inPlace: true
     },
     {
       file: ".vite/build/mainWindow.js",
-      transform: patchMacVirtualizationEntitlementCheck,
+      transform: (content) => patchUltraLocalBridge(patchMacVirtualizationEntitlementCheck(content)),
       inPlace: true
     }
   ]);
@@ -1241,8 +1268,9 @@ export async function prepareMacPortableRuntime(rootDir, app, dictionary, option
   const userDataDir = path.join(runtimeDir, "user-data");
   const statusPath = path.join(runtimeDir, "claude-cn-runtime.json");
   const previousStatus = await readJsonIfExists(statusPath);
+  const injectionHash = options.injectionSource ? sha256(Buffer.from(options.injectionSource, "utf8")) : null;
 
-  if ((await pathExists(runtimeExe)) && isCompleteMacRuntimeStatus(previousStatus)) {
+  if ((await pathExists(runtimeExe)) && isCompleteMacRuntimeStatus(previousStatus, injectionHash)) {
     const transientCleanupStats = await removeMacBundleTransientFiles(runtimeApp);
     const signingStats = transientCleanupStats.removed > 0
       ? await signMacApp(runtimeApp)
@@ -1267,12 +1295,14 @@ export async function prepareMacPortableRuntime(rootDir, app, dictionary, option
       },
       asarIntegrityStats: previousStatus.asarIntegrityStats || { patched: 0 },
       signingStats,
-      transientCleanupStats
+      transientCleanupStats,
+      injectionHash
     };
   }
 
-  if (!(await pathExists(runtimeExe)) || !isCompleteMacRuntimeStatus(previousStatus)) {
-    await fs.rm(runtimeDir, { recursive: true, force: true });
+  if (!(await pathExists(runtimeExe)) || !isCompleteMacRuntimeStatus(previousStatus, injectionHash)) {
+    await fs.rm(runtimeApp, { recursive: true, force: true });
+    await fs.rm(statusPath, { force: true });
     await fs.mkdir(runtimeDir, { recursive: true });
     await retryBusyFileOperation(() => fs.cp(app.installLocation, runtimeApp, {
       recursive: true,
@@ -1300,6 +1330,7 @@ export async function prepareMacPortableRuntime(rootDir, app, dictionary, option
         sourceVersion: app.version,
         platform: "darwin",
         runtimeApp,
+        injectionHash,
         mainProcessPatchMarker: MAIN_PROCESS_PATCH_MARKER,
         localeStats,
         effortStats,
@@ -1334,6 +1365,7 @@ export async function prepareMacPortableRuntime(rootDir, app, dictionary, option
     identityStats,
     transientCleanupStats,
     asarIntegrityStats,
-    signingStats
+    signingStats,
+    injectionHash
   };
 }

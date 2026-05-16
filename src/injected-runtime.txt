@@ -2,6 +2,10 @@ function injectedRuntime(config) {
   const globalKey = "__CLAUDE_ZH_CN_OVERLAY__";
   const languageCardId = "claude-ultra-language-card";
   const localeChoiceKey = "__claude_ultra_locale_choice__";
+  const ultraMenuId = "claude-ultra-menu";
+  const ultraPanelId = "claude-ultra-panel";
+  const ultraSettingsKey = "__claude_ultra_features__";
+  const oneMillionContextBeta = "context-1m-2025-08-07";
 
   const createOverlay = () => {
     const state = {
@@ -18,7 +22,12 @@ function injectedRuntime(config) {
       originalInputValues: new WeakMap(),
       originalElementText: new WeakMap(),
       normalizedDictionary: new Map(),
-      segmentEntries: []
+      segmentEntries: [],
+      ultraMenuOpen: false,
+      ultraRoot: null,
+      ultraPanel: null,
+      ultraRefreshTimer: null,
+      ultraDocumentListenerBound: false
     };
 
     const normalizeLocale = (value) => String(value || "").replace("_", "-").toLowerCase();
@@ -70,6 +79,161 @@ function injectedRuntime(config) {
         return state.config.launchLocale || state.config.locale || "zh-CN";
       }
       return readStoredLocale() || state.config.launchLocale || state.config.locale || "zh-CN";
+    };
+
+    const ultraMessages = {
+      en: {
+        panelTitle: "Ultra",
+        button: "Ultra",
+        buttonEnabled: "Ultra 1M",
+        buttonTitle: "Ultra",
+        buttonTitleEnabled: "Ultra: 1M context enabled",
+        oneMillionLabel: "1M context",
+        oneMillionDescription: "Use Claude Code's long-context beta while keeping the API model name unchanged."
+      },
+      zh: {
+        panelTitle: "Ultra",
+        button: "Ultra",
+        buttonEnabled: "Ultra 1M",
+        buttonTitle: "Ultra",
+        buttonTitleEnabled: "Ultra：已启用 1M 上下文",
+        oneMillionLabel: "1M 上下文",
+        oneMillionDescription: "使用 Claude Code 的长上下文 beta，同时保持 API model 名不变。"
+      }
+    };
+
+    const ultraLocaleKey = () => (
+      normalizeLocale(state.currentLocale || readCurrentLocale()).startsWith("zh") ? "zh" : "en"
+    );
+
+    const ultraText = (key) => {
+      const messages = ultraMessages[ultraLocaleKey()] || ultraMessages.en;
+      return messages[key] || ultraMessages.en[key] || key;
+    };
+
+    const defaultUltraSettings = () => ({
+      oneMillionContext: false
+    });
+
+    const readUltraSettings = () => {
+      try {
+        const raw = localStorage.getItem(ultraSettingsKey);
+        if (!raw) {
+          return defaultUltraSettings();
+        }
+        return { ...defaultUltraSettings(), ...JSON.parse(raw) };
+      } catch {
+        return defaultUltraSettings();
+      }
+    };
+
+    const writeUltraSettings = (settings) => {
+      try {
+        localStorage.setItem(ultraSettingsKey, JSON.stringify({ ...defaultUltraSettings(), ...settings }));
+      } catch {}
+      refreshUltraMenu();
+    };
+
+    const updateUltraSetting = (key, value) => {
+      writeUltraSettings({ ...readUltraSettings(), [key]: value });
+    };
+
+    const isOneMillionContextEnabled = () => readUltraSettings().oneMillionContext === true;
+
+    const stripContextSuffix = (model) => (
+      typeof model === "string" ? model.replace(/\[(1|2)m\]$/i, "").trim() : model
+    );
+
+    const hasContextSuffix = (model) => (
+      typeof model === "string" && /\[(1|2)m\]$/i.test(model.trim())
+    );
+
+    const shouldSkipModelSuffix = (model) => {
+      const normalized = String(model || "").trim().toLowerCase();
+      return !normalized || normalized === "default";
+    };
+
+    const modelWithOneMillionContext = (model) => {
+      if (!isOneMillionContextEnabled() || shouldSkipModelSuffix(model) || hasContextSuffix(model)) {
+        return model;
+      }
+      return `${model}[1m]`;
+    };
+
+    const prepareLocalSessionInfo = (info) => {
+      if (!info || typeof info !== "object" || !isOneMillionContextEnabled()) {
+        return info;
+      }
+      const nextModel = modelWithOneMillionContext(info.model);
+      if (nextModel === info.model) {
+        return info;
+      }
+      return { ...info, model: nextModel };
+    };
+
+    const appendBetaHeader = (headers) => {
+      const current = headers.get("anthropic-beta") || headers.get("Anthropic-Beta") || "";
+      const values = current.split(",").map((value) => value.trim()).filter(Boolean);
+      if (!values.includes(oneMillionContextBeta)) {
+        values.push(oneMillionContextBeta);
+      }
+      headers.set("anthropic-beta", values.join(","));
+    };
+
+    const prepareMessagesRequestInit = (url, init) => {
+      if (!isOneMillionContextEnabled() || !init || typeof init !== "object") {
+        return init;
+      }
+
+      let parsedUrl;
+      try {
+        parsedUrl = new URL(String(url), location.href);
+      } catch {
+        return init;
+      }
+
+      if (!/\/v1\/messages\/?$/.test(parsedUrl.pathname)) {
+        return init;
+      }
+
+      const body = init.body;
+      if (typeof body !== "string") {
+        return init;
+      }
+
+      let payload;
+      try {
+        payload = JSON.parse(body);
+      } catch {
+        return init;
+      }
+
+      if (!payload || typeof payload !== "object" || typeof payload.model !== "string" || !Array.isArray(payload.messages)) {
+        return init;
+      }
+
+      const headers = new Headers(init.headers || {});
+      appendBetaHeader(headers);
+      const nextPayload = { ...payload, model: stripContextSuffix(payload.model) };
+      return { ...init, headers, body: JSON.stringify(nextPayload) };
+    };
+
+    const exposeUltraApi = () => {
+      const api = {
+        isOneMillionContextEnabled,
+        modelWithOneMillionContext,
+        stripContextSuffix,
+        prepareLocalSessionInfo,
+        prepareMessagesRequestInit
+      };
+      globalThis.__CLAUDE_ULTRA__ = api;
+      globalThis.__CLAUDE_ULTRA_PREPARE_MODEL__ = modelWithOneMillionContext;
+      globalThis.__CLAUDE_ULTRA_PREPARE_LOCAL_SESSION__ = prepareLocalSessionInfo;
+      globalThis.__CLAUDE_ULTRA_PREPARE_MESSAGES_REQUEST__ = prepareMessagesRequestInit;
+      globalThis._cuM = modelWithOneMillionContext;
+      globalThis._cu1 = prepareLocalSessionInfo;
+      globalThis._uM = modelWithOneMillionContext;
+      globalThis._u1 = prepareLocalSessionInfo;
     };
 
     const syncEnabled = () => {
@@ -441,6 +605,366 @@ function injectedRuntime(config) {
       row.appendChild(chineseButton);
     };
 
+    const visibleRect = (element) => {
+      if (!(element instanceof Element)) {
+        return null;
+      }
+      const rect = element.getBoundingClientRect();
+      if (rect.width <= 0 || rect.height <= 0) {
+        return null;
+      }
+      const style = getComputedStyle(element);
+      if (style.visibility === "hidden" || style.display === "none" || Number(style.opacity) === 0) {
+        return null;
+      }
+      return rect;
+    };
+
+    const buttonName = (button) => [
+      button.getAttribute("aria-label"),
+      button.getAttribute("title"),
+      button.getAttribute("data-testid"),
+      button.textContent
+    ].filter(Boolean).join(" ").trim();
+
+    const buttonSelector = "button,[role='button'],[role='combobox'],[aria-label],[title]";
+
+    const exactAddButtonName = (name) => {
+      const normalized = String(name || "").replace(/\s+/g, " ").trim();
+      return normalized === "+" || /(?:^|\s)(?:add|添加)(?:\s|$)/i.test(normalized);
+    };
+
+    const permissionModeButtonName = (name) => (
+      /accept edit|accept edits|接受编辑|permission|permissions|权限|计划模式|plan mode|bypass|ask/i.test(String(name || ""))
+    );
+
+    const rectCenterY = (rect) => rect.top + (rect.height / 2);
+
+    const sameButtonRow = (left, right) => (
+      Math.abs(rectCenterY(left) - rectCenterY(right)) <= Math.max(10, Math.min(left.height, right.height) * 0.7)
+    );
+
+    const isComposerTextbox = (element) => {
+      if (!(element instanceof HTMLElement)) {
+        return false;
+      }
+      if (element.matches("textarea,[contenteditable='true'],[role='textbox']")) {
+        return Boolean(visibleRect(element));
+      }
+      return false;
+    };
+
+    const findComposerRoot = () => {
+      const textboxes = [...document.querySelectorAll("textarea,[contenteditable='true'],[role='textbox']")]
+        .filter(isComposerTextbox)
+        .sort((left, right) => right.getBoundingClientRect().bottom - left.getBoundingClientRect().bottom);
+      for (const textbox of textboxes) {
+        let best = null;
+        let current = textbox;
+        for (let depth = 0; current && depth < 8; depth += 1, current = current.parentElement) {
+          const buttons = [...current.querySelectorAll(buttonSelector)].filter((button) => visibleRect(button));
+          if (buttons.length >= 2) {
+            if (!best || buttons.length >= best.buttons.length) {
+              best = { element: current, buttons };
+            }
+          }
+        }
+        if (best) {
+          return best.element;
+        }
+      }
+      return null;
+    };
+
+    const findAttachmentButton = (root) => {
+      if (!root) {
+        return null;
+      }
+      const buttons = [...root.querySelectorAll(buttonSelector)].filter((button) => {
+        if (button.id === ultraMenuId || button.closest(`#${ultraPanelId}`)) {
+          return false;
+        }
+        return Boolean(visibleRect(button));
+      });
+      const lowerRowButtons = buttons
+        .map((button) => ({ button, rect: button.getBoundingClientRect(), name: buttonName(button) }))
+        .sort((left, right) => right.rect.bottom - left.rect.bottom);
+      const composerTextbox = [...root.querySelectorAll("textarea,[contenteditable='true'],[role='textbox']")]
+        .filter(isComposerTextbox)
+        .sort((left, right) => right.getBoundingClientRect().bottom - left.getBoundingClientRect().bottom)[0];
+      const composerTextboxRect = composerTextbox?.getBoundingClientRect();
+      if (composerTextboxRect) {
+        const addButton = lowerRowButtons
+          .filter((entry) => (
+            exactAddButtonName(entry.name)
+            && entry.rect.top >= composerTextboxRect.bottom - 18
+          ))
+          .sort((left, right) => {
+            const leftDistance = Math.abs(left.rect.top - composerTextboxRect.bottom);
+            const rightDistance = Math.abs(right.rect.top - composerTextboxRect.bottom);
+            return leftDistance - rightDistance || left.rect.left - right.rect.left;
+          })[0];
+        if (addButton) {
+          return addButton.button;
+        }
+      }
+
+      const permissionButtons = lowerRowButtons.filter((entry) => permissionModeButtonName(entry.name));
+      for (const permissionButton of permissionButtons) {
+        const addButton = lowerRowButtons
+          .filter((entry) => (
+            entry !== permissionButton
+            && exactAddButtonName(entry.name)
+            && sameButtonRow(entry.rect, permissionButton.rect)
+            && entry.rect.left >= permissionButton.rect.right - 8
+          ))
+          .sort((left, right) => left.rect.left - right.rect.left)[0];
+        if (addButton) {
+          return addButton.button;
+        }
+      }
+
+      const bottom = lowerRowButtons[0]?.rect.bottom ?? 0;
+      const lowerRow = lowerRowButtons.filter((entry) => Math.abs(entry.rect.bottom - bottom) < 14);
+      const exactAdd = lowerRow.find((entry) => exactAddButtonName(entry.name));
+      if (exactAdd) {
+        return exactAdd.button;
+      }
+      const compactAdd = lowerRow.find((entry) => (
+        /add|attach|附件|添加/i.test(entry.name)
+        && entry.rect.width <= 56
+      ));
+      if (compactAdd) {
+        return compactAdd.button;
+      }
+      const plusButton = buttons.find((button) => button.textContent?.trim() === "+");
+      if (plusButton) {
+        return plusButton;
+      }
+      const svgButton = buttons.find((button) => button.querySelector("svg") && button.getBoundingClientRect().width <= 48);
+      return svgButton;
+    };
+
+    const buttonBaseStyle = () => [
+      "height:32px",
+      "min-width:32px",
+      "padding:0 10px",
+      "border-radius:8px",
+      "border:1px solid color-mix(in srgb, currentColor 16%, transparent)",
+      "background:color-mix(in srgb, Canvas 92%, transparent)",
+      "color:inherit",
+      "font:600 12px/1 system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif",
+      "display:inline-flex",
+      "align-items:center",
+      "justify-content:center",
+      "gap:6px",
+      "cursor:pointer",
+      "box-sizing:border-box",
+      "white-space:nowrap"
+    ].join(";");
+
+    const panelStyle = () => [
+      "position:fixed",
+      "z-index:2147483647",
+      "width:260px",
+      "box-sizing:border-box",
+      "border:1px solid rgba(0,0,0,.14)",
+      "border-radius:10px",
+      "background:rgba(255,255,255,.98)",
+      "box-shadow:0 14px 42px rgba(0,0,0,.18)",
+      "padding:8px",
+      "font:13px/1.35 system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif",
+      "color:#2f2a24"
+    ].join(";");
+
+    const ultraFeatures = () => [
+      {
+        id: "oneMillionContext",
+        label: ultraText("oneMillionLabel"),
+        description: ultraText("oneMillionDescription"),
+        enabled: isOneMillionContextEnabled,
+        setEnabled: (value) => updateUltraSetting("oneMillionContext", value)
+      }
+    ];
+
+    const positionUltraPanel = () => {
+      if (!state.ultraRoot || !state.ultraPanel || !state.ultraMenuOpen) {
+        return;
+      }
+      const rect = state.ultraRoot.getBoundingClientRect();
+      const panel = state.ultraPanel;
+      const width = panel.offsetWidth || 260;
+      const height = panel.offsetHeight || 160;
+      const left = Math.max(8, Math.min(window.innerWidth - width - 8, rect.right - width));
+      const top = rect.top > height + 14
+        ? rect.top - height - 8
+        : Math.min(window.innerHeight - height - 8, rect.bottom + 8);
+      panel.style.left = `${left}px`;
+      panel.style.top = `${Math.max(8, top)}px`;
+    };
+
+    const renderUltraPanel = () => {
+      if (!document.body) {
+        return;
+      }
+      let panel = document.getElementById(ultraPanelId);
+      if (!state.ultraMenuOpen) {
+        panel?.remove();
+        state.ultraPanel = null;
+        return;
+      }
+      if (!panel) {
+        panel = document.createElement("div");
+        panel.id = ultraPanelId;
+        panel.setAttribute("data-claude-cn-skip", "true");
+        panel.style.cssText = panelStyle();
+        document.body.appendChild(panel);
+      }
+      panel.lang = normalizeLocale(state.currentLocale || readCurrentLocale());
+      state.ultraPanel = panel;
+      panel.replaceChildren();
+
+      const heading = document.createElement("div");
+      heading.textContent = ultraText("panelTitle");
+      heading.style.cssText = "font-weight:700;margin:2px 4px 8px";
+      panel.appendChild(heading);
+
+      for (const feature of ultraFeatures()) {
+        const row = document.createElement("label");
+        row.style.cssText = [
+          "display:flex",
+          "align-items:center",
+          "gap:10px",
+          "padding:9px 8px",
+          "border-radius:8px",
+          "cursor:pointer"
+        ].join(";");
+        row.addEventListener("mouseenter", () => {
+          row.style.background = "rgba(0,0,0,.045)";
+        });
+        row.addEventListener("mouseleave", () => {
+          row.style.background = "transparent";
+        });
+
+        const input = document.createElement("input");
+        input.type = "checkbox";
+        input.checked = feature.enabled();
+        input.setAttribute("aria-label", feature.label);
+        input.style.cssText = "width:16px;height:16px;margin:0;accent-color:#8f5a32";
+        input.addEventListener("change", () => {
+          feature.setEnabled(input.checked);
+        });
+        row.appendChild(input);
+
+        const copy = document.createElement("span");
+        copy.style.cssText = "display:flex;flex-direction:column;gap:2px;min-width:0";
+        const label = document.createElement("span");
+        label.textContent = feature.label;
+        label.style.cssText = "font-weight:650;color:#2f2a24";
+        const description = document.createElement("span");
+        description.textContent = feature.description;
+        description.style.cssText = "font-size:12px;color:#6f665d";
+        copy.append(label, description);
+        row.appendChild(copy);
+        panel.appendChild(row);
+      }
+
+      positionUltraPanel();
+    };
+
+    function refreshUltraMenu() {
+      if (state.ultraRefreshTimer !== null) {
+        clearTimeout(state.ultraRefreshTimer);
+      }
+      state.ultraRefreshTimer = setTimeout(() => {
+        state.ultraRefreshTimer = null;
+        renderUltraMenu();
+        renderUltraPanel();
+      }, 0);
+    }
+
+    const renderUltraMenu = () => {
+      if (!document.body) {
+        return;
+      }
+
+      const root = document.getElementById(ultraMenuId);
+      const composerRoot = findComposerRoot();
+      const attachmentButton = findAttachmentButton(composerRoot);
+
+      if (!composerRoot || !attachmentButton) {
+        if (root) {
+          root.style.position = "fixed";
+          root.style.right = "18px";
+          root.style.bottom = "18px";
+          document.body.appendChild(root);
+        }
+      } else if (root && root.previousElementSibling !== attachmentButton) {
+        attachmentButton.insertAdjacentElement("afterend", root);
+      }
+
+      const button = root || document.createElement("button");
+      if (!root) {
+        button.id = ultraMenuId;
+        button.type = "button";
+        button.setAttribute("data-claude-cn-skip", "true");
+        button.setAttribute("aria-haspopup", "menu");
+      }
+      button.onclick = (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        state.ultraMenuOpen = !state.ultraMenuOpen;
+        renderUltraMenu();
+        renderUltraPanel();
+      };
+      button.onkeydown = (event) => {
+        if (event.key !== "Enter" && event.key !== " ") {
+          return;
+        }
+        event.preventDefault();
+        event.stopPropagation();
+        state.ultraMenuOpen = !state.ultraMenuOpen;
+        renderUltraMenu();
+        renderUltraPanel();
+      };
+      if (!state.ultraDocumentListenerBound) {
+        state.ultraDocumentListenerBound = true;
+        document.addEventListener("click", (event) => {
+          if (!state.ultraMenuOpen) {
+            return;
+          }
+          if (button.contains(event.target) || state.ultraPanel?.contains(event.target)) {
+            return;
+          }
+          state.ultraMenuOpen = false;
+          renderUltraMenu();
+          renderUltraPanel();
+        }, true);
+      }
+
+      const enabled = isOneMillionContextEnabled();
+      button.textContent = enabled ? ultraText("buttonEnabled") : ultraText("button");
+      button.title = enabled ? ultraText("buttonTitleEnabled") : ultraText("buttonTitle");
+      button.lang = normalizeLocale(state.currentLocale || readCurrentLocale());
+      button.setAttribute("aria-expanded", String(state.ultraMenuOpen));
+      button.style.cssText = buttonBaseStyle();
+      if (enabled) {
+        button.style.background = "#fff1e8";
+        button.style.borderColor = "#e2a37a";
+        button.style.color = "#7a3516";
+      }
+
+      if (!button.isConnected) {
+        if (attachmentButton) {
+          attachmentButton.insertAdjacentElement("afterend", button);
+        } else {
+          document.body.appendChild(button);
+        }
+      }
+      state.ultraRoot = button;
+      positionUltraPanel();
+    };
+
     const processRootInternal = (root) => {
       if (root.nodeType === Node.TEXT_NODE) {
         processTextNode(root);
@@ -484,6 +1008,8 @@ function injectedRuntime(config) {
         syncEnabled();
         processRootInternal(root);
         renderLanguageCard();
+        renderUltraMenu();
+        renderUltraPanel();
       });
     };
 
@@ -492,6 +1018,8 @@ function injectedRuntime(config) {
         processRoot(document.documentElement);
       } else {
         renderLanguageCard();
+        renderUltraMenu();
+        renderUltraPanel();
       }
     };
 
@@ -548,9 +1076,30 @@ function injectedRuntime(config) {
       });
     };
 
+    const hookMessagesFetch = () => {
+      const originalFetch = window.fetch;
+      if (!originalFetch || originalFetch.__claudeUltraPatched) {
+        return;
+      }
+      const patchedFetch = function patchedClaudeUltraFetch(input, init) {
+        try {
+          const url = input instanceof Request ? input.url : input;
+          const nextInit = prepareMessagesRequestInit(url, init);
+          if (nextInit !== init) {
+            return originalFetch.call(this, input, nextInit);
+          }
+        } catch {}
+        return originalFetch.call(this, input, init);
+      };
+      patchedFetch.__claudeUltraPatched = true;
+      window.fetch = patchedFetch;
+    };
+
     const start = () => {
       update(config);
+      exposeUltraApi();
       state.currentLocale = readCurrentLocale();
+      hookMessagesFetch();
       hookNavigation();
       hookLocaleChanges();
       const desiredLocale = preferredLocale();
@@ -583,6 +1132,8 @@ function injectedRuntime(config) {
             }
           }
           renderLanguageCard();
+          renderUltraMenu();
+          renderUltraPanel();
         });
       });
 

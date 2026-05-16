@@ -306,6 +306,10 @@ async function fetchGatewayModels(config, options = {}) {
   return options.includeNonChatModels ? models : models.filter(isChatLikeModel);
 }
 
+function canFetchGatewayModels(config) {
+  return config.inferenceProvider === "gateway" && Boolean(config.inferenceGatewayBaseUrl);
+}
+
 function canProbeGateway(config) {
   return config.inferenceProvider === "gateway"
     && Boolean(config.inferenceGatewayBaseUrl)
@@ -426,8 +430,11 @@ export async function syncThirdPartyModels(options = {}) {
 
   let fetchedModels = [];
   let fetchError = null;
+  const shouldFetchGatewayModels = canFetchGatewayModels(config);
+  let fetchedGatewayModels = false;
   try {
     fetchedModels = await fetchGatewayModels(config, options);
+    fetchedGatewayModels = shouldFetchGatewayModels;
   } catch (error) {
     fetchError = error instanceof Error ? error.message : String(error);
   }
@@ -439,7 +446,12 @@ export async function syncThirdPartyModels(options = {}) {
       ?? process.env.CLAUDE_3P_MODELS
   );
   const existingModels = configuredModelNames(config);
-  const discoveredModels = [...new Set([...requestedModels, ...fetchedModels, ...existingModels])].filter(Boolean);
+  const shouldUseExistingModels = requestedModels.length === 0 && !fetchedGatewayModels;
+  const discoveredModels = [...new Set([
+    ...requestedModels,
+    ...fetchedModels,
+    ...(shouldUseExistingModels ? existingModels : [])
+  ])].filter(Boolean);
   const orderedModels = orderModelsForGateway(discoveredModels);
   const hasThirdPartyConnection = Boolean(
     config.inferenceProvider
@@ -466,6 +478,7 @@ export async function syncThirdPartyModels(options = {}) {
     if (shouldActivateThirdParty) {
       const nextConfig = {
         ...config,
+        ...(fetchedGatewayModels || requestedModels.length > 0 ? { inferenceModels: [] } : {}),
         unstableDisableModelVerification: true
       };
       const previous = JSON.stringify(config);

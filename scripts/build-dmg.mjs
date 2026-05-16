@@ -16,6 +16,7 @@ const dmgPath = path.join(distDir, `Claude-ultra-macos-${os.arch()}.dmg`);
 const dmgStagingDir = path.join(distDir, "dmg-staging");
 const dmgMountPoint = path.join(distDir, "dmg-mount");
 const readWriteDmgPath = path.join(distDir, `Claude-ultra-macos-${os.arch()}-rw.dmg`);
+const launcherBinaryPath = path.join(distDir, `Claude-ultra-macos-${os.arch() === "arm64" ? "arm64" : "x64"}`);
 
 const nodePath = process.execPath;
 const packageJson = JSON.parse(await fs.readFile(path.join(rootDir, "package.json"), "utf8"));
@@ -107,6 +108,12 @@ async function createIcns() {
 
 async function writeLauncher() {
   const launcherPath = path.join(macosDir, appName);
+  if (await pathExists(launcherBinaryPath)) {
+    await fs.copyFile(launcherBinaryPath, launcherPath);
+    await fs.chmod(launcherPath, 0o755);
+    return;
+  }
+
   const content = `#!/bin/sh
 DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
 exec "$DIR/../Resources/node" "$DIR/../Resources/app/bin/claude-cn.mjs" launch "$@"
@@ -164,25 +171,16 @@ async function createDmgStaging() {
 }
 
 async function createApplicationsAlias() {
-  const script = `
-tell application "Finder"
-  set dmgFolder to POSIX file "${dmgMountPoint}" as alias
-  if exists item "Applications" of dmgFolder then
-    delete item "Applications" of dmgFolder
-  end if
-  make new alias file to POSIX file "/Applications" at dmgFolder with properties {name:"Applications"}
-end tell
-`;
-
-  try {
-    await run("osascript", ["-e", script]);
-  } catch (error) {
-    console.warn(`[build-dmg] Finder alias could not be created; falling back to a symlink: ${error.message}`);
-    await fs.symlink("/Applications", path.join(dmgMountPoint, "Applications"));
-  }
+  const target = path.join(dmgMountPoint, "Applications");
+  await fs.rm(target, { recursive: true, force: true });
+  await fs.symlink("/Applications", target);
 }
 
 async function applyDmgFinderLayout() {
+  if (process.env.CLAUDE_ULTRA_DMG_FINDER_LAYOUT !== "1") {
+    return;
+  }
+
   const script = `
 tell application "Finder"
   set dmgFolder to POSIX file "${dmgMountPoint}" as alias
@@ -285,8 +283,10 @@ await fs.rm(readWriteDmgPath, { force: true });
 await fs.mkdir(macosDir, { recursive: true });
 await fs.mkdir(resourcesDir, { recursive: true });
 
-await fs.copyFile(nodePath, path.join(resourcesDir, "node"));
-await fs.chmod(path.join(resourcesDir, "node"), 0o755);
+if (!(await pathExists(launcherBinaryPath))) {
+  await fs.copyFile(nodePath, path.join(resourcesDir, "node"));
+  await fs.chmod(path.join(resourcesDir, "node"), 0o755);
+}
 await copyProjectFiles();
 const iconPath = await createIcns();
 await writeLauncher();
