@@ -14,7 +14,8 @@ const PRELOAD_PATCH_MARKER = "CLAUDE_CN_PRELOAD_PATCH";
 const MAIN_PROCESS_PATCH_MARKER = "CLAUDE_CN_MAIN_PROCESS_PATCH_V8_ULTRA_MENU";
 const ULTRA_MAX_EFFORT_PATCH_MARKER = "CLAUDE_ULTRA_MAX_EFFORT_PATCH";
 const NATIVE_LANGUAGE_LIST_PATCH_MARKER = "CLAUDE_ULTRA_NATIVE_LANGUAGE_LIST_PATCH";
-const PORTABLE_COMPATIBILITY_PATCH_VERSION = 5;
+const CODE_ORG_DISABLED_GATE_PATCH_MARKER = "CLAUDE_ULTRA_CODE_ORG_DISABLED_GATE_PATCH";
+const PORTABLE_COMPATIBILITY_PATCH_VERSION = 8;
 const MAC_RUNTIME_APP_NAME = "Claude ultra";
 const MAC_RUNTIME_BUNDLE_IDENTIFIER = "com.claudeultra.runtime";
 const MAC_RUNTIME_IDENTITY_VERSION = 2;
@@ -912,8 +913,8 @@ function patchMacSharedConfigWrites(content) {
   );
 }
 
-function patchMacDesktopUserAgent(content) {
-  const userAgentPattern = /(vI\(\)&&\((\w+)\.app\.userAgentFallback=`\$\{\2\.app\.userAgentFallback\} MSIX`\);)(xfr\(\);)/;
+export function patchMacDesktopUserAgent(content) {
+  const userAgentPattern = /((?:vI|qI)\(\)&&\((\w+)\.app\.userAgentFallback=`\$\{\2\.app\.userAgentFallback\} MSIX`\);)([A-Za-z_$][\w$]*\(\);)/;
   return content.replace(
     userAgentPattern,
     (_match, prefix, electronName, suffix) => `${prefix}${electronName}.app.userAgentFallback+=\` Claude/\${${electronName}.app.getVersion()}\`;${suffix}`
@@ -946,6 +947,59 @@ export function patchUltraLocalBridge(content) {
   return nextContent;
 }
 
+export function applyCodeOrgDisabledGatePatch(content) {
+  if (
+    !content.includes("baku_enabled")
+    || !content.includes("/code/disabled")
+    || content.includes(CODE_ORG_DISABLED_GATE_PATCH_MARKER)
+  ) {
+    return { content, changed: false, count: 0 };
+  }
+
+  const disabledGatePattern = /(,[A-Za-z_$][\w$]*=[A-Za-z_$][\w$]*\("baku_enabled"\),([A-Za-z_$][\w$]*)=[A-Za-z_$][\w$]*\(\),)([A-Za-z_$][\w$]*)=!1===\2,(?=\{onboardingPage:)/g;
+  const result = replaceWithCount(content, disabledGatePattern, (_match, prefix, _availabilityName, disabledName) => (
+    `${prefix}${disabledName}=false,`
+  ));
+
+  if (result.count === 0) {
+    return { content, changed: false, count: 0 };
+  }
+
+  return {
+    content: `${result.content}\n;window.__${CODE_ORG_DISABLED_GATE_PATCH_MARKER}__=true;\n`,
+    changed: true,
+    count: result.count
+  };
+}
+
+async function patchCodeOrgDisabledGate(resourcesDir) {
+  const ionDistDir = path.join(resourcesDir, "ion-dist");
+  if (!(await pathExists(ionDistDir))) {
+    return { patched: 0, rules: [] };
+  }
+
+  let patched = 0;
+  let replacements = 0;
+
+  for (const filePath of await findJavaScriptFiles(ionDistDir)) {
+    const content = await fs.readFile(filePath, "utf8");
+    const result = applyCodeOrgDisabledGatePatch(content);
+    if (!result.changed) {
+      continue;
+    }
+
+    await fs.writeFile(filePath, result.content, "utf8");
+    patched += 1;
+    replacements += result.count;
+  }
+
+  return {
+    patched,
+    replacements,
+    rules: patched > 0 ? ["code-org-disabled-gate"] : []
+  };
+}
+
 async function patchPortableCompatibility(resourcesDir) {
   const asarPath = path.join(resourcesDir, "app.asar");
   if (!(await pathExists(asarPath))) {
@@ -974,7 +1028,13 @@ async function patchPortableCompatibility(resourcesDir) {
       inPlace: true
     }
   ]);
-  return { ...result, version: PORTABLE_COMPATIBILITY_PATCH_VERSION };
+  const codeGateStats = await patchCodeOrgDisabledGate(resourcesDir);
+  return {
+    ...result,
+    patched: result.patched + codeGateStats.patched,
+    codeGateStats,
+    version: PORTABLE_COMPATIBILITY_PATCH_VERSION
+  };
 }
 
 async function findJavaScriptFiles(rootPath) {

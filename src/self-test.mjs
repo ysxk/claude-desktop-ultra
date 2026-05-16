@@ -9,7 +9,9 @@ import { detectClaude } from "./adapters/claude-desktop.mjs";
 import { buildInjectionSource } from "./injection-source.mjs";
 import { loadProfile } from "./locale.mjs";
 import {
+  applyCodeOrgDisabledGatePatch,
   applyMaxEffortPatchRules,
+  patchMacDesktopUserAgent,
   patchUltraLocalBridge,
   prepareMacPortableRuntime,
   preparePortableRuntime
@@ -647,6 +649,24 @@ function testUltraLocalBridgePatch(recorder) {
   recorder.check("Ultra bridge 会包装 setModel 入参", patched.includes("self._uM?.(A)||A"));
 }
 
+function testCodeOrgDisabledGatePatch(recorder) {
+  const fixture = 'function yj({children:t}){const e=rt(),r=p(),n=d(),o=!y(),a=G(),u=$(),c=i("baku_enabled"),l=V(),s=!1===l,{onboardingPage:f,isLoading:h,hasError:v,environments:m,hasRunnerPools:b,refetch:g}=nj(),w=m&&m.length>0||b,O=n?.startsWith("/code/onboarding"),x="/code/family"===n,j=n?.startsWith("/code/disabled"),S=n?.startsWith("/code/share/"),P=n?.startsWith("/code/security"),E=n?.startsWith("/code/session_")||n?.startsWith("/code/cse_"),A=H.useMemo(()=>n?.startsWith("/code")||n?.startsWith("/claude-ship")?S?null:P?`/security${window.location.search}`:c&&n?.startsWith("/claude-ship")?s?"/code/disabled":a?null:"/upgrade":u||void 0===l?"loading":s?j?null:"/code/disabled":j&&!s?"/code":a?O?v?"error":null===f?"/code":null:E?null:h?"loading":v?"error":w?x?"/code":null:x?null:"/code/family":x?null:o?"https://claude.com/product/claude-code":"https://claude.com/product/claude-code?reason=no_org_access":null,[a,n,o,w,u,c,h,v,f,O,x,S,P,E,j,l,s]);return A}';
+  const result = applyCodeOrgDisabledGatePatch(fixture);
+
+  recorder.check("Claude Code org-admin 禁用门禁会被识别", result.count === 1);
+  recorder.check("Claude Code org-admin 禁用门禁会被本地关闭", result.content.includes("l=V(),s=false,{onboardingPage"));
+}
+
+function testMacDesktopUserAgentPatch(recorder) {
+  const legacyFixture = 'vI()&&(Q.app.userAgentFallback=`${Q.app.userAgentFallback} MSIX`);xfr();';
+  const currentFixture = 'qI()&&(cA.app.userAgentFallback=`${cA.app.userAgentFallback} MSIX`);bkr();';
+  const legacyPatched = patchMacDesktopUserAgent(legacyFixture);
+  const currentPatched = patchMacDesktopUserAgent(currentFixture);
+
+  recorder.check("macOS 旧版桌面 UA 补丁会追加 Claude 标识", legacyPatched.includes('Q.app.userAgentFallback+=` Claude/${Q.app.getVersion()}`;xfr();'));
+  recorder.check("macOS 新版桌面 UA 补丁会追加 Claude 标识", currentPatched.includes('cA.app.userAgentFallback+=` Claude/${cA.app.getVersion()}`;bkr();'));
+}
+
 function testMaxEffortPatchKeepsModelMenuPrimary(recorder) {
   const fixture = [
     'return!(!s.includes("opus-4-6")&&!s.includes("opus-4-7"))||!!t&&!(s.includes("haiku")||s.includes("sonnet")||s.includes("opus"))',
@@ -735,6 +755,8 @@ export async function runWindowsSelfTest({ rootDir, flags = {}, logger = console
     testUltraMenuI18n(recorder);
     testUltraMenuPrefersComposerAddButton(recorder);
     testUltraLocalBridgePatch(recorder);
+    testCodeOrgDisabledGatePatch(recorder);
+    testMacDesktopUserAgentPatch(recorder);
     testMaxEffortPatchKeepsModelMenuPrimary(recorder);
     await testEmptyConfigDoesNotActivate(recorder);
     await testBlankModelSync(recorder, gateway);
