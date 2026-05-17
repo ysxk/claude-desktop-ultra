@@ -638,6 +638,42 @@ function testUltraMenuPrefersComposerAddButton(recorder) {
   delete globalThis.ultraPanelId;
 }
 
+function testUltraMenuStableInteraction(recorder) {
+  const source = buildInjectionSource({
+    dictionary: {},
+    profile: {
+      locale: "zh-CN",
+      fallbackLocale: "en-US",
+      translateAttributes: [],
+      skipTextSelectors: []
+    },
+    launchLocale: "zh-CN",
+    localeOverride: true
+  });
+
+  recorder.check(
+    "Ultra menu filters overlay-only mutation records",
+    source.includes("externalRecords = records.filter((record) => !isOverlayMutationRecord(record))")
+      && source.includes("externalRecords.length === 0")
+  );
+  recorder.check(
+    "Ultra panel keeps checkbox DOM stable after first build",
+    source.includes("const syncUltraPanelControls")
+      && source.includes("if (!syncUltraPanelControls(panel))")
+      && source.includes("buildUltraPanelContents(panel)")
+  );
+  recorder.check(
+    "Ultra panel row click toggles state without depending only on checkbox change",
+    source.includes('row.addEventListener("click"')
+      && source.includes("toggleFeature()")
+      && source.includes('input.addEventListener("keydown"')
+  );
+  recorder.check(
+    "Ultra outside-click listener uses the current root button",
+    source.includes("state.ultraRoot?.contains(event.target)")
+  );
+}
+
 function testUltraLocalBridgePatch(recorder) {
   const fixture = [
     'start(e){return abc.ipcRenderer.invoke("123_claude.web_$_LocalAgentModeSessions_$_start",e)}',
@@ -754,6 +790,7 @@ export async function runWindowsSelfTest({ rootDir, flags = {}, logger = console
     testUltraRuntimeApi(recorder);
     testUltraMenuI18n(recorder);
     testUltraMenuPrefersComposerAddButton(recorder);
+    testUltraMenuStableInteraction(recorder);
     testUltraLocalBridgePatch(recorder);
     testCodeOrgDisabledGatePatch(recorder);
     testMacDesktopUserAgentPatch(recorder);

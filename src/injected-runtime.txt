@@ -240,8 +240,12 @@ function injectedRuntime(config) {
       const currentLocale = state.currentLocale || readCurrentLocale();
       state.enabled = isTargetLocale(currentLocale);
       if (document.documentElement) {
-        document.documentElement.setAttribute("data-claude-ultra-locale", currentLocale);
-        document.documentElement.lang = currentLocale;
+        if (document.documentElement.getAttribute("data-claude-ultra-locale") !== currentLocale) {
+          document.documentElement.setAttribute("data-claude-ultra-locale", currentLocale);
+        }
+        if (document.documentElement.lang !== currentLocale) {
+          document.documentElement.lang = currentLocale;
+        }
       }
     };
 
@@ -787,6 +791,30 @@ function injectedRuntime(config) {
       }
     ];
 
+    const overlayElementSelector = `#${ultraMenuId},#${ultraPanelId},#${languageCardId}`;
+
+    const isOverlayNode = (node) => {
+      if (!node) {
+        return false;
+      }
+      const element = node.nodeType === Node.ELEMENT_NODE ? node : node.parentElement;
+      if (!(element instanceof Element)) {
+        return false;
+      }
+      return Boolean(
+        element.id === ultraMenuId
+        || element.id === ultraPanelId
+        || element.id === languageCardId
+        || element.closest(overlayElementSelector)
+      );
+    };
+
+    const isOverlayMutationRecord = (record) => (
+      isOverlayNode(record.target)
+      || [...record.addedNodes].some(isOverlayNode)
+      || [...record.removedNodes].some(isOverlayNode)
+    );
+
     const positionUltraPanel = () => {
       if (!state.ultraRoot || !state.ultraPanel || !state.ultraMenuOpen) {
         return;
@@ -801,6 +829,123 @@ function injectedRuntime(config) {
         : Math.min(window.innerHeight - height - 8, rect.bottom + 8);
       panel.style.left = `${left}px`;
       panel.style.top = `${Math.max(8, top)}px`;
+    };
+
+    const syncUltraPanelControls = (panel) => {
+      let complete = true;
+      for (const feature of ultraFeatures()) {
+        const row = panel.querySelector(`[data-ultra-feature="${feature.id}"]`);
+        if (!row) {
+          complete = false;
+          continue;
+        }
+        const enabled = feature.enabled();
+        const ariaChecked = String(enabled);
+        if (row.getAttribute("aria-checked") !== ariaChecked) {
+          row.setAttribute("aria-checked", ariaChecked);
+        }
+        const input = row.querySelector("input[type='checkbox']");
+        if (!input) {
+          complete = false;
+        } else {
+          input.checked = enabled;
+          if (input.getAttribute("aria-label") !== feature.label) {
+            input.setAttribute("aria-label", feature.label);
+          }
+        }
+        const label = row.querySelector("[data-ultra-label]");
+        if (!label) {
+          complete = false;
+        } else if (label.textContent !== feature.label) {
+          label.textContent = feature.label;
+        }
+        const description = row.querySelector("[data-ultra-description]");
+        if (!description) {
+          complete = false;
+        } else if (description.textContent !== feature.description) {
+          description.textContent = feature.description;
+        }
+      }
+      return complete;
+    };
+
+    const buildUltraPanelContents = (panel) => {
+      panel.replaceChildren();
+
+      const heading = document.createElement("div");
+      heading.textContent = ultraText("panelTitle");
+      heading.style.cssText = "font-weight:700;margin:2px 4px 8px";
+      panel.appendChild(heading);
+
+      for (const feature of ultraFeatures()) {
+        const row = document.createElement("div");
+        row.setAttribute("role", "menuitemcheckbox");
+        row.setAttribute("tabindex", "0");
+        row.setAttribute("data-ultra-feature", feature.id);
+        row.style.cssText = [
+          "display:flex",
+          "align-items:center",
+          "gap:10px",
+          "padding:9px 8px",
+          "border-radius:8px",
+          "cursor:pointer"
+        ].join(";");
+        row.addEventListener("mouseenter", () => {
+          row.style.background = "rgba(0,0,0,.045)";
+        });
+        row.addEventListener("mouseleave", () => {
+          row.style.background = "transparent";
+        });
+
+        const input = document.createElement("input");
+        input.type = "checkbox";
+        input.style.cssText = "width:16px;height:16px;margin:0;accent-color:#8f5a32";
+        input.addEventListener("click", (event) => {
+          event.stopPropagation();
+        });
+        input.addEventListener("keydown", (event) => {
+          event.stopPropagation();
+        });
+        input.addEventListener("change", () => {
+          feature.setEnabled(input.checked);
+          syncUltraPanelControls(panel);
+        });
+        row.appendChild(input);
+
+        const toggleFeature = () => {
+          const next = !feature.enabled();
+          feature.setEnabled(next);
+          input.checked = next;
+          syncUltraPanelControls(panel);
+        };
+        row.addEventListener("click", (event) => {
+          event.preventDefault();
+          event.stopPropagation();
+          toggleFeature();
+        });
+        row.addEventListener("keydown", (event) => {
+          if (event.key !== "Enter" && event.key !== " ") {
+            return;
+          }
+          event.preventDefault();
+          event.stopPropagation();
+          toggleFeature();
+        });
+
+        const copy = document.createElement("span");
+        copy.style.cssText = "display:flex;flex-direction:column;gap:2px;min-width:0";
+        const label = document.createElement("span");
+        label.setAttribute("data-ultra-label", "true");
+        label.style.cssText = "font-weight:650;color:#2f2a24";
+        const description = document.createElement("span");
+        description.setAttribute("data-ultra-description", "true");
+        description.style.cssText = "font-size:12px;color:#6f665d";
+        copy.append(label, description);
+        row.appendChild(copy);
+        panel.appendChild(row);
+      }
+
+      syncUltraPanelControls(panel);
     };
 
     const renderUltraPanel = () => {
@@ -820,53 +965,13 @@ function injectedRuntime(config) {
         panel.style.cssText = panelStyle();
         document.body.appendChild(panel);
       }
-      panel.lang = normalizeLocale(state.currentLocale || readCurrentLocale());
+      const panelLang = normalizeLocale(state.currentLocale || readCurrentLocale());
+      if (panel.lang !== panelLang) {
+        panel.lang = panelLang;
+      }
       state.ultraPanel = panel;
-      panel.replaceChildren();
-
-      const heading = document.createElement("div");
-      heading.textContent = ultraText("panelTitle");
-      heading.style.cssText = "font-weight:700;margin:2px 4px 8px";
-      panel.appendChild(heading);
-
-      for (const feature of ultraFeatures()) {
-        const row = document.createElement("label");
-        row.style.cssText = [
-          "display:flex",
-          "align-items:center",
-          "gap:10px",
-          "padding:9px 8px",
-          "border-radius:8px",
-          "cursor:pointer"
-        ].join(";");
-        row.addEventListener("mouseenter", () => {
-          row.style.background = "rgba(0,0,0,.045)";
-        });
-        row.addEventListener("mouseleave", () => {
-          row.style.background = "transparent";
-        });
-
-        const input = document.createElement("input");
-        input.type = "checkbox";
-        input.checked = feature.enabled();
-        input.setAttribute("aria-label", feature.label);
-        input.style.cssText = "width:16px;height:16px;margin:0;accent-color:#8f5a32";
-        input.addEventListener("change", () => {
-          feature.setEnabled(input.checked);
-        });
-        row.appendChild(input);
-
-        const copy = document.createElement("span");
-        copy.style.cssText = "display:flex;flex-direction:column;gap:2px;min-width:0";
-        const label = document.createElement("span");
-        label.textContent = feature.label;
-        label.style.cssText = "font-weight:650;color:#2f2a24";
-        const description = document.createElement("span");
-        description.textContent = feature.description;
-        description.style.cssText = "font-size:12px;color:#6f665d";
-        copy.append(label, description);
-        row.appendChild(copy);
-        panel.appendChild(row);
+      if (!syncUltraPanelControls(panel)) {
+        buildUltraPanelContents(panel);
       }
 
       positionUltraPanel();
@@ -933,7 +1038,7 @@ function injectedRuntime(config) {
           if (!state.ultraMenuOpen) {
             return;
           }
-          if (button.contains(event.target) || state.ultraPanel?.contains(event.target)) {
+          if (state.ultraRoot?.contains(event.target) || state.ultraPanel?.contains(event.target)) {
             return;
           }
           state.ultraMenuOpen = false;
@@ -943,10 +1048,21 @@ function injectedRuntime(config) {
       }
 
       const enabled = isOneMillionContextEnabled();
-      button.textContent = enabled ? ultraText("buttonEnabled") : ultraText("button");
-      button.title = enabled ? ultraText("buttonTitleEnabled") : ultraText("buttonTitle");
-      button.lang = normalizeLocale(state.currentLocale || readCurrentLocale());
-      button.setAttribute("aria-expanded", String(state.ultraMenuOpen));
+      const nextButtonText = enabled ? ultraText("buttonEnabled") : ultraText("button");
+      const nextButtonTitle = enabled ? ultraText("buttonTitleEnabled") : ultraText("buttonTitle");
+      const nextButtonLang = normalizeLocale(state.currentLocale || readCurrentLocale());
+      if (button.textContent !== nextButtonText) {
+        button.textContent = nextButtonText;
+      }
+      if (button.title !== nextButtonTitle) {
+        button.title = nextButtonTitle;
+      }
+      if (button.lang !== nextButtonLang) {
+        button.lang = nextButtonLang;
+      }
+      if (button.getAttribute("aria-expanded") !== String(state.ultraMenuOpen)) {
+        button.setAttribute("aria-expanded", String(state.ultraMenuOpen));
+      }
       button.style.cssText = buttonBaseStyle();
       if (enabled) {
         button.style.background = "#fff1e8";
@@ -1113,6 +1229,10 @@ function injectedRuntime(config) {
       }
 
       state.observer = new MutationObserver((records) => {
+        const externalRecords = records.filter((record) => !isOverlayMutationRecord(record));
+        if (externalRecords.length === 0) {
+          return;
+        }
         if (state.mutating) {
           scheduleRefresh(80);
           return;
@@ -1120,7 +1240,7 @@ function injectedRuntime(config) {
 
         withMutationPause(() => {
           syncEnabled();
-          for (const record of records) {
+          for (const record of externalRecords) {
             if (record.type === "characterData") {
               processRootInternal(record.target);
             } else if (record.type === "attributes") {
