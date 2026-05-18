@@ -5,6 +5,10 @@ function injectedRuntime(config) {
   const ultraMenuId = "claude-ultra-menu";
   const ultraPanelId = "claude-ultra-panel";
   const ultraSettingsKey = "__claude_ultra_features__";
+  const skillTranslateCacheKey = "__claude_ultra_baidu_skill_cache__";
+  const skillTranslateDebugKey = "__claude_ultra_baidu_skill_debug__";
+  const skillTranslateMarker = "data-claude-ultra-skill-translate";
+  const skillTranslateTargetMarker = "data-claude-ultra-skill-description";
   const oneMillionContextBeta = "context-1m-2025-08-07";
 
   const createOverlay = () => {
@@ -23,6 +27,9 @@ function injectedRuntime(config) {
       originalElementText: new WeakMap(),
       normalizedDictionary: new Map(),
       segmentEntries: [],
+      skillAutoTranslatePending: new WeakSet(),
+      skillAutoTranslateCache: null,
+      skillAutoTranslateDebug: null,
       ultraMenuOpen: false,
       ultraRoot: null,
       ultraPanel: null,
@@ -89,7 +96,19 @@ function injectedRuntime(config) {
         buttonTitle: "Ultra",
         buttonTitleEnabled: "Ultra: 1M context enabled",
         oneMillionLabel: "1M context",
-        oneMillionDescription: "Use Claude Code's long-context beta while keeping the API model name unchanged."
+        oneMillionDescription: "Use Claude Code's long-context beta while keeping the API model name unchanged.",
+        baiduSectionTitle: "Baidu Translate",
+        baiduAppIdLabel: "App ID",
+        baiduSecretKeyLabel: "Secret key",
+        baiduConfigured: "Configured",
+        baiduNotConfigured: "Not configured",
+        baiduClear: "Clear",
+        baiduAutoTranslateLabel: "Auto translate skill descriptions",
+        baiduAutoTranslateDescription: "Replace descriptions as soon as they appear.",
+        translateSkillDescription: "Translate description",
+        translatingSkillDescription: "Translating...",
+        translatedSkillDescription: "Translated",
+        translateFailed: "Translate failed"
       },
       zh: {
         panelTitle: "Ultra",
@@ -98,7 +117,19 @@ function injectedRuntime(config) {
         buttonTitle: "Ultra",
         buttonTitleEnabled: "Ultra：已启用 1M 上下文",
         oneMillionLabel: "1M 上下文",
-        oneMillionDescription: "使用 Claude Code 的长上下文 beta，同时保持 API model 名不变。"
+        oneMillionDescription: "使用 Claude Code 的长上下文 beta，同时保持 API model 名不变。",
+        baiduSectionTitle: "\u767e\u5ea6\u7ffb\u8bd1",
+        baiduAppIdLabel: "App ID",
+        baiduSecretKeyLabel: "\u5bc6\u94a5",
+        baiduConfigured: "\u5df2\u914d\u7f6e",
+        baiduNotConfigured: "\u672a\u914d\u7f6e",
+        baiduClear: "\u6e05\u7a7a",
+        baiduAutoTranslateLabel: "\u81ea\u52a8\u7ffb\u8bd1\u6280\u80fd\u7b80\u4ecb",
+        baiduAutoTranslateDescription: "\u6280\u80fd\u7b80\u4ecb\u51fa\u73b0\u540e\u76f4\u63a5\u66ff\u6362\u4e3a\u8bd1\u6587\u3002",
+        translateSkillDescription: "\u7ffb\u8bd1\u7b80\u4ecb",
+        translatingSkillDescription: "\u7ffb\u8bd1\u4e2d...",
+        translatedSkillDescription: "\u5df2\u7ffb\u8bd1",
+        translateFailed: "\u7ffb\u8bd1\u5931\u8d25"
       }
     };
 
@@ -112,7 +143,13 @@ function injectedRuntime(config) {
     };
 
     const defaultUltraSettings = () => ({
-      oneMillionContext: false
+      oneMillionContext: false,
+      baiduTranslate: {
+        appId: "",
+        secretKey: "",
+        autoTranslate: false,
+        expanded: false
+      }
     });
 
     const readUltraSettings = () => {
@@ -139,6 +176,336 @@ function injectedRuntime(config) {
     };
 
     const isOneMillionContextEnabled = () => readUltraSettings().oneMillionContext === true;
+
+    const readBaiduTranslateConfig = () => {
+      const settings = readUltraSettings();
+      const configValue = settings.baiduTranslate && typeof settings.baiduTranslate === "object"
+        ? settings.baiduTranslate
+        : {};
+      return {
+        appId: String(configValue.appId || settings.baiduTranslateAppId || "").trim(),
+        secretKey: String(configValue.secretKey || settings.baiduTranslateSecretKey || "").trim(),
+        autoTranslate: configValue.autoTranslate === true || settings.baiduTranslateAutoTranslate === true,
+        expanded: configValue.expanded === true || settings.baiduTranslateExpanded === true
+      };
+    };
+
+    const writeBaiduTranslateConfig = (config) => {
+      const settings = readUltraSettings();
+      writeUltraSettings({
+        ...settings,
+        baiduTranslate: {
+          ...readBaiduTranslateConfig(),
+          ...config
+        }
+      });
+      document.querySelectorAll?.("[data-claude-ultra-skill-auto]").forEach((element) => {
+        element.removeAttribute("data-claude-ultra-skill-auto");
+        element.removeAttribute("data-claude-ultra-skill-error");
+      });
+      setTimeout(() => renderSkillDescriptionTranslateButtons(), 0);
+    };
+
+    const hasBaiduTranslateConfig = () => {
+      const config = readBaiduTranslateConfig();
+      return Boolean(config.appId && config.secretKey);
+    };
+
+    const isBaiduAutoTranslateEnabled = () => {
+      const config = readBaiduTranslateConfig();
+      return Boolean(config.appId && config.secretKey && config.autoTranslate);
+    };
+
+    const leftRotate32 = (value, bits) => (
+      (value << bits) | (value >>> (32 - bits))
+    );
+
+    const md5Hex = (value) => {
+      const bytes = [...new TextEncoder().encode(String(value))];
+      const bitLength = bytes.length * 8;
+      bytes.push(0x80);
+      while (bytes.length % 64 !== 56) {
+        bytes.push(0);
+      }
+      for (let index = 0; index < 8; index += 1) {
+        bytes.push(Math.floor(bitLength / (2 ** (8 * index))) & 0xff);
+      }
+
+      let a0 = 0x67452301;
+      let b0 = 0xefcdab89;
+      let c0 = 0x98badcfe;
+      let d0 = 0x10325476;
+      const shiftAmounts = [
+        7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22,
+        5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20,
+        4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23,
+        6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21
+      ];
+      const constants = Array.from({ length: 64 }, (_item, index) => (
+        Math.floor(Math.abs(Math.sin(index + 1)) * 2 ** 32) | 0
+      ));
+
+      for (let offset = 0; offset < bytes.length; offset += 64) {
+        const words = [];
+        for (let index = 0; index < 16; index += 1) {
+          const cursor = offset + (index * 4);
+          words[index] = (
+            bytes[cursor]
+            | (bytes[cursor + 1] << 8)
+            | (bytes[cursor + 2] << 16)
+            | (bytes[cursor + 3] << 24)
+          );
+        }
+
+        let a = a0;
+        let b = b0;
+        let c = c0;
+        let d = d0;
+        for (let index = 0; index < 64; index += 1) {
+          let f;
+          let wordIndex;
+          if (index < 16) {
+            f = (b & c) | ((~b) & d);
+            wordIndex = index;
+          } else if (index < 32) {
+            f = (d & b) | ((~d) & c);
+            wordIndex = (5 * index + 1) % 16;
+          } else if (index < 48) {
+            f = b ^ c ^ d;
+            wordIndex = (3 * index + 5) % 16;
+          } else {
+            f = c ^ (b | (~d));
+            wordIndex = (7 * index) % 16;
+          }
+          const next = d;
+          d = c;
+          c = b;
+          b = (b + leftRotate32((a + f + constants[index] + words[wordIndex]) | 0, shiftAmounts[index])) | 0;
+          a = next;
+        }
+
+        a0 = (a0 + a) | 0;
+        b0 = (b0 + b) | 0;
+        c0 = (c0 + c) | 0;
+        d0 = (d0 + d) | 0;
+      }
+
+      const wordToHex = (word) => [0, 8, 16, 24]
+        .map((shift) => ((word >>> shift) & 0xff).toString(16).padStart(2, "0"))
+        .join("");
+      return [a0, b0, c0, d0].map(wordToHex).join("");
+    };
+
+    const translateWithBaiduWindowBridge = (text) => new Promise((resolve, reject) => {
+      if (!window?.postMessage || !window?.addEventListener) {
+        reject(new Error("Baidu Translate bridge is not available."));
+        return;
+      }
+      const requestMessage = "__CLAUDE_ULTRA_BAIDU_TRANSLATE_REQUEST__";
+      const responseMessage = "__CLAUDE_ULTRA_BAIDU_TRANSLATE_RESPONSE__";
+      const id = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+      let timer = null;
+      const cleanup = () => {
+        if (timer) {
+          clearTimeout(timer);
+          timer = null;
+        }
+        window.removeEventListener("message", onMessage);
+      };
+      const onMessage = (event) => {
+        const data = event?.data;
+        if (event.source !== window || !data || data.source !== responseMessage || data.id !== id) {
+          return;
+        }
+        cleanup();
+        if (data.ok && typeof data.translated === "string" && data.translated.trim()) {
+          resolve(data.translated.trim());
+          return;
+        }
+        reject(new Error(data.error || "Baidu Translate bridge returned no result."));
+      };
+      window.addEventListener("message", onMessage);
+      timer = setTimeout(() => {
+        cleanup();
+        reject(new Error("Baidu Translate bridge timed out."));
+      }, 12000);
+      window.postMessage({
+        source: requestMessage,
+        id,
+        payload: { text: String(text || "").trim() }
+      }, "*");
+    });
+
+    const translateWithBaidu = async (text) => {
+      const config = readBaiduTranslateConfig();
+      if (!config.appId || !config.secretKey) {
+        throw new Error("Baidu Translate API is not configured.");
+      }
+      const query = String(text || "").trim();
+      if (!query) {
+        return query;
+      }
+      const errors = [];
+      const errorMessage = (error) => String(error?.message || error || "Unknown error");
+      const recordTranslateAttempt = (phase, extra = {}) => {
+        recordSkillTranslateDebug({ phase, text: query, ...extra });
+      };
+      const bridge = globalThis.__CLAUDE_ULTRA_BAIDU_BRIDGE__;
+      if (bridge?.translate) {
+        recordTranslateAttempt("baidu-direct-bridge");
+        try {
+          const translated = await bridge.translate({
+            text: query,
+            appId: config.appId,
+            secretKey: config.secretKey
+          });
+          if (typeof translated === "string" && translated.trim()) {
+            recordTranslateAttempt("baidu-direct-bridge-ok");
+            return translated.trim();
+          }
+          throw new Error("Baidu Translate bridge returned no result.");
+        } catch (error) {
+          const message = errorMessage(error);
+          errors.push(`direct bridge: ${message}`);
+          recordTranslateAttempt("baidu-direct-bridge-failed", { error: message });
+        }
+      } else {
+        recordTranslateAttempt("baidu-direct-bridge-missing");
+      }
+      try {
+        recordTranslateAttempt("baidu-window-bridge");
+        const translated = await translateWithBaiduWindowBridge(query);
+        if (typeof translated === "string" && translated.trim()) {
+          recordTranslateAttempt("baidu-window-bridge-ok");
+          return translated.trim();
+        }
+        throw new Error("Baidu Translate window bridge returned no result.");
+      } catch (error) {
+        const message = errorMessage(error);
+        errors.push(`window bridge: ${message}`);
+        recordTranslateAttempt("baidu-window-bridge-failed", { error: message });
+      }
+      try {
+        recordTranslateAttempt("baidu-renderer-fetch");
+        const salt = `${Date.now()}${Math.floor(Math.random() * 100000)}`;
+        const params = new URLSearchParams({
+          q: query,
+          from: "auto",
+          to: "zh",
+          appid: config.appId,
+          salt,
+          sign: md5Hex(`${config.appId}${query}${salt}${config.secretKey}`)
+        });
+        const response = await fetch(`https://fanyi-api.baidu.com/api/trans/vip/translate?${params.toString()}`, {
+          method: "GET",
+          credentials: "omit"
+        });
+        if (!response.ok) {
+          throw new Error(`Baidu Translate HTTP ${response.status}`);
+        }
+        const payload = await response.json();
+        if (payload?.error_code) {
+          throw new Error(payload.error_msg || `Baidu Translate error ${payload.error_code}`);
+        }
+        const lines = Array.isArray(payload?.trans_result)
+          ? payload.trans_result.map((item) => item?.dst).filter(Boolean)
+          : [];
+        if (lines.length === 0) {
+          throw new Error("Baidu Translate returned no result.");
+        }
+        recordTranslateAttempt("baidu-renderer-fetch-ok");
+        return lines.join("\n");
+      } catch (error) {
+        const message = errorMessage(error);
+        errors.push(`renderer fetch: ${message}`);
+        recordTranslateAttempt("baidu-renderer-fetch-failed", { error: message });
+      }
+      throw new Error(errors.join("; ") || "Baidu Translate failed.");
+    };
+
+    const normalizedSkillTranslationSource = (text) => (
+      normalizeVisibleText(text).slice(0, 5000)
+    );
+
+    const readSkillTranslationCache = () => {
+      if (state.skillAutoTranslateCache && typeof state.skillAutoTranslateCache === "object") {
+        return state.skillAutoTranslateCache;
+      }
+      try {
+        const parsed = JSON.parse(localStorage.getItem(skillTranslateCacheKey) || "{}");
+        state.skillAutoTranslateCache = parsed && typeof parsed === "object" ? parsed : {};
+      } catch {
+        state.skillAutoTranslateCache = {};
+      }
+      return state.skillAutoTranslateCache;
+    };
+
+    const writeSkillTranslationCache = (cache) => {
+      const entries = Object.entries(cache)
+        .filter(([, value]) => value && typeof value.dst === "string")
+        .sort((a, b) => (b[1].time || 0) - (a[1].time || 0))
+        .slice(0, 120);
+      state.skillAutoTranslateCache = Object.fromEntries(entries);
+      try {
+        localStorage.setItem(skillTranslateCacheKey, JSON.stringify(state.skillAutoTranslateCache));
+      } catch {}
+    };
+
+    const skillTranslationCacheId = (text) => {
+      const source = normalizedSkillTranslationSource(text);
+      return source ? md5Hex(source) : "";
+    };
+
+    const cachedSkillTranslation = (text) => {
+      const id = skillTranslationCacheId(text);
+      if (!id) {
+        return "";
+      }
+      const entry = readSkillTranslationCache()[id];
+      return entry && entry.src === normalizedSkillTranslationSource(text) ? entry.dst : "";
+    };
+
+    const rememberSkillTranslation = (source, translated) => {
+      const id = skillTranslationCacheId(source);
+      const normalizedSource = normalizedSkillTranslationSource(source);
+      const normalizedTranslated = normalizeVisibleText(translated);
+      if (!id || !normalizedSource || !normalizedTranslated || normalizedSource === normalizedTranslated) {
+        return;
+      }
+      const cache = readSkillTranslationCache();
+      cache[id] = { src: normalizedSource, dst: normalizedTranslated, time: Date.now() };
+      writeSkillTranslationCache(cache);
+    };
+
+    const readSkillTranslateDebug = () => {
+      if (state.skillAutoTranslateDebug && typeof state.skillAutoTranslateDebug === "object") {
+        return state.skillAutoTranslateDebug;
+      }
+      try {
+        const parsed = JSON.parse(localStorage.getItem(skillTranslateDebugKey) || "null");
+        state.skillAutoTranslateDebug = parsed && typeof parsed === "object" ? parsed : null;
+      } catch {
+        state.skillAutoTranslateDebug = null;
+      }
+      return state.skillAutoTranslateDebug;
+    };
+
+    const recordSkillTranslateDebug = (details) => {
+      const payload = {
+        at: new Date().toISOString(),
+        ...details
+      };
+      if (typeof payload.text === "string") {
+        payload.text = payload.text.slice(0, 240);
+      }
+      if (typeof payload.error === "string") {
+        payload.error = payload.error.slice(0, 300);
+      }
+      state.skillAutoTranslateDebug = payload;
+      try {
+        localStorage.setItem(skillTranslateDebugKey, JSON.stringify(payload));
+      } catch {}
+    };
 
     const stripContextSuffix = (model) => (
       typeof model === "string" ? model.replace(/\[(1|2)m\]$/i, "").trim() : model
@@ -219,12 +586,53 @@ function injectedRuntime(config) {
     };
 
     const exposeUltraApi = () => {
+      const debugSkillDescriptions = () => {
+        const slashTargets = findSlashSkillHoverDescriptionTargets();
+        const failedTargets = [...document.querySelectorAll('[data-claude-ultra-skill-auto="failed"]')]
+          .slice(0, 8)
+          .map((target) => ({
+            text: normalizeVisibleText(target.textContent).slice(0, 220),
+            error: String(target.getAttribute("data-claude-ultra-skill-error") || "")
+          }));
+        return {
+          hasBaiduConfig: hasBaiduTranslateConfig(),
+          autoTranslate: isBaiduAutoTranslateEnabled(),
+          slashMenuCount: visibleSlashSkillMenus().length,
+          slashFilterCount: visibleSlashSkillFilterElements().length,
+          slashContextVisible: slashSkillContextVisible(),
+          detailTargetCount: findSkillDescriptionTargets().length,
+          slashTargetCount: slashTargets.length,
+          slashTargets: slashTargets.slice(0, 8).map((target) => {
+            const rect = visibleRect(target);
+            return {
+              text: normalizeVisibleText(target.textContent).slice(0, 220),
+              className: String(target.getAttribute("class") || ""),
+              parentClassName: String(target.parentElement?.getAttribute("class") || ""),
+              rect: rect ? {
+                left: Math.round(rect.left),
+                top: Math.round(rect.top),
+                width: Math.round(rect.width),
+                height: Math.round(rect.height)
+              } : null
+            };
+          }),
+          failedTargets,
+          lastTranslateDebug: readSkillTranslateDebug()
+        };
+      };
       const api = {
         isOneMillionContextEnabled,
+        hasBaiduTranslateConfig,
+        isBaiduAutoTranslateEnabled,
         modelWithOneMillionContext,
         stripContextSuffix,
         prepareLocalSessionInfo,
-        prepareMessagesRequestInit
+        prepareMessagesRequestInit,
+        refreshSkillDescriptionTranslations: () => {
+          renderSkillDescriptionTranslateButtons();
+          return debugSkillDescriptions();
+        },
+        debugSkillDescriptions
       };
       globalThis.__CLAUDE_ULTRA__ = api;
       globalThis.__CLAUDE_ULTRA_PREPARE_MODEL__ = modelWithOneMillionContext;
@@ -770,7 +1178,7 @@ function injectedRuntime(config) {
     const panelStyle = () => [
       "position:fixed",
       "z-index:2147483647",
-      "width:260px",
+      "width:300px",
       "box-sizing:border-box",
       "border:1px solid rgba(0,0,0,.14)",
       "border-radius:10px",
@@ -791,7 +1199,7 @@ function injectedRuntime(config) {
       }
     ];
 
-    const overlayElementSelector = `#${ultraMenuId},#${ultraPanelId},#${languageCardId}`;
+    const overlayElementSelector = `#${ultraMenuId},#${ultraPanelId},#${languageCardId},[${skillTranslateMarker}]`;
 
     const isOverlayNode = (node) => {
       if (!node) {
@@ -821,7 +1229,7 @@ function injectedRuntime(config) {
       }
       const rect = state.ultraRoot.getBoundingClientRect();
       const panel = state.ultraPanel;
-      const width = panel.offsetWidth || 260;
+      const width = panel.offsetWidth || 300;
       const height = panel.offsetHeight || 160;
       const left = Math.max(8, Math.min(window.innerWidth - width - 8, rect.right - width));
       const top = rect.top > height + 14
@@ -829,6 +1237,260 @@ function injectedRuntime(config) {
         : Math.min(window.innerHeight - height - 8, rect.bottom + 8);
       panel.style.left = `${left}px`;
       panel.style.top = `${Math.max(8, top)}px`;
+    };
+
+    const ultraInputStyle = () => [
+      "width:100%",
+      "height:30px",
+      "box-sizing:border-box",
+      "border:1px solid rgba(0,0,0,.14)",
+      "border-radius:7px",
+      "background:#fff",
+      "color:#2f2a24",
+      "padding:0 8px",
+      "font:12px/1.2 system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif",
+      "outline:none"
+    ].join(";");
+
+    const syncBaiduTranslateControls = (panel) => {
+      const section = panel.querySelector("[data-ultra-baidu-section]");
+      if (!section) {
+        return false;
+      }
+      const config = readBaiduTranslateConfig();
+      const configured = Boolean(config.appId && config.secretKey);
+      const toggle = section.querySelector("[data-ultra-baidu-toggle]");
+      const content = section.querySelector("[data-ultra-baidu-content]");
+      const appIdInput = section.querySelector("[data-ultra-baidu-app-id]");
+      const secretKeyInput = section.querySelector("[data-ultra-baidu-secret-key]");
+      const autoRow = section.querySelector("[data-ultra-baidu-auto-row]");
+      const autoInput = section.querySelector("[data-ultra-baidu-auto]");
+      const autoLabel = section.querySelector("[data-ultra-baidu-auto-label]");
+      const autoDescription = section.querySelector("[data-ultra-baidu-auto-description]");
+      const chevron = section.querySelector("[data-ultra-baidu-chevron]");
+      const status = section.querySelector("[data-ultra-baidu-status]");
+      const title = section.querySelector("[data-ultra-baidu-title]");
+      const appIdLabel = section.querySelector("[data-ultra-baidu-app-label]");
+      const secretKeyLabel = section.querySelector("[data-ultra-baidu-secret-label]");
+      const clearButton = section.querySelector("[data-ultra-baidu-clear]");
+      if (!toggle || !content || !appIdInput || !secretKeyInput || !autoRow || !autoInput || !autoLabel || !autoDescription || !chevron || !status || !title || !appIdLabel || !secretKeyLabel || !clearButton) {
+        return false;
+      }
+
+      title.textContent = ultraText("baiduSectionTitle");
+      appIdLabel.textContent = ultraText("baiduAppIdLabel");
+      secretKeyLabel.textContent = ultraText("baiduSecretKeyLabel");
+      autoLabel.textContent = ultraText("baiduAutoTranslateLabel");
+      autoDescription.textContent = ultraText("baiduAutoTranslateDescription");
+      clearButton.textContent = ultraText("baiduClear");
+      chevron.textContent = config.expanded ? "\u25b4" : "\u25be";
+      toggle.setAttribute("aria-expanded", String(config.expanded));
+      content.style.display = config.expanded ? "flex" : "none";
+
+      if (document.activeElement !== appIdInput && appIdInput.value !== config.appId) {
+        appIdInput.value = config.appId;
+      }
+      if (document.activeElement !== secretKeyInput && secretKeyInput.value !== config.secretKey) {
+        secretKeyInput.value = config.secretKey;
+      }
+      autoInput.checked = Boolean(config.autoTranslate && configured);
+      autoInput.disabled = !configured;
+      autoRow.setAttribute("aria-checked", String(autoInput.checked));
+      autoRow.style.opacity = configured ? "1" : ".58";
+
+      status.textContent = configured ? ultraText("baiduConfigured") : ultraText("baiduNotConfigured");
+      status.style.background = configured ? "#eaf7ef" : "#f4f1ed";
+      status.style.color = configured ? "#246b3d" : "#6f665d";
+      clearButton.style.display = config.appId || config.secretKey ? "inline-flex" : "none";
+      return true;
+    };
+
+    const buildBaiduTranslateSection = () => {
+      const section = document.createElement("div");
+      section.setAttribute("data-ultra-baidu-section", "true");
+      section.style.cssText = [
+        "border-top:1px solid rgba(0,0,0,.08)",
+        "margin:8px 4px 0",
+        "padding:4px 0 2px",
+        "display:flex",
+        "flex-direction:column",
+        "gap:4px"
+      ].join(";");
+
+      const titleRow = document.createElement("button");
+      titleRow.type = "button";
+      titleRow.setAttribute("data-ultra-baidu-toggle", "true");
+      titleRow.style.cssText = [
+        "width:100%",
+        "height:34px",
+        "border:0",
+        "border-radius:8px",
+        "background:transparent",
+        "padding:0 4px",
+        "display:flex",
+        "align-items:center",
+        "justify-content:space-between",
+        "gap:8px",
+        "cursor:pointer",
+        "font:12px/1.2 system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif",
+        "color:inherit",
+        "text-align:left"
+      ].join(";");
+      titleRow.addEventListener("mouseenter", () => {
+        titleRow.style.background = "rgba(0,0,0,.045)";
+      });
+      titleRow.addEventListener("mouseleave", () => {
+        titleRow.style.background = "transparent";
+      });
+      titleRow.addEventListener("click", (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        writeBaiduTranslateConfig({ expanded: !readBaiduTranslateConfig().expanded });
+        syncBaiduTranslateControls(section.closest(`#${ultraPanelId}`) || section);
+      });
+      const title = document.createElement("div");
+      title.setAttribute("data-ultra-baidu-title", "true");
+      title.style.cssText = "font-weight:700;color:#2f2a24";
+      const titleMeta = document.createElement("span");
+      titleMeta.style.cssText = "display:flex;align-items:center;gap:6px";
+      const status = document.createElement("span");
+      status.setAttribute("data-ultra-baidu-status", "true");
+      status.style.cssText = [
+        "border-radius:999px",
+        "padding:3px 7px",
+        "font:600 11px/1 system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif",
+        "white-space:nowrap"
+      ].join(";");
+      const chevron = document.createElement("span");
+      chevron.setAttribute("data-ultra-baidu-chevron", "true");
+      chevron.style.cssText = "font:700 12px/1 system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif;color:#6f665d";
+      titleMeta.append(status, chevron);
+      titleRow.append(title, titleMeta);
+      section.appendChild(titleRow);
+
+      const content = document.createElement("div");
+      content.setAttribute("data-ultra-baidu-content", "true");
+      content.style.cssText = [
+        "display:flex",
+        "flex-direction:column",
+        "gap:8px",
+        "padding:4px"
+      ].join(";");
+
+      const makeField = (marker, labelMarker, type) => {
+        const label = document.createElement("label");
+        label.style.cssText = "display:flex;flex-direction:column;gap:4px;font-size:11px;font-weight:650;color:#6f665d";
+        const labelText = document.createElement("span");
+        labelText.setAttribute(labelMarker, "true");
+        const input = document.createElement("input");
+        input.type = type;
+        input.spellcheck = false;
+        input.autocomplete = "off";
+        input.setAttribute(marker, "true");
+        input.style.cssText = ultraInputStyle();
+        input.addEventListener("click", (event) => {
+          event.stopPropagation();
+        });
+        input.addEventListener("keydown", (event) => {
+          event.stopPropagation();
+        });
+        input.addEventListener("input", () => {
+          const appId = section.querySelector("[data-ultra-baidu-app-id]")?.value || "";
+          const secretKey = section.querySelector("[data-ultra-baidu-secret-key]")?.value || "";
+          writeBaiduTranslateConfig({ appId, secretKey });
+        });
+        label.append(labelText, input);
+        return label;
+      };
+
+      content.appendChild(makeField("data-ultra-baidu-app-id", "data-ultra-baidu-app-label", "text"));
+      content.appendChild(makeField("data-ultra-baidu-secret-key", "data-ultra-baidu-secret-label", "password"));
+
+      const autoRow = document.createElement("div");
+      autoRow.setAttribute("role", "menuitemcheckbox");
+      autoRow.setAttribute("tabindex", "0");
+      autoRow.setAttribute("data-ultra-baidu-auto-row", "true");
+      autoRow.style.cssText = [
+        "display:flex",
+        "align-items:flex-start",
+        "gap:8px",
+        "padding:3px 0",
+        "cursor:pointer"
+      ].join(";");
+      const autoInput = document.createElement("input");
+      autoInput.type = "checkbox";
+      autoInput.setAttribute("data-ultra-baidu-auto", "true");
+      autoInput.style.cssText = "width:15px;height:15px;margin:1px 0 0;accent-color:#8f5a32";
+      autoInput.addEventListener("click", (event) => {
+        event.stopPropagation();
+      });
+      autoInput.addEventListener("keydown", (event) => {
+        event.stopPropagation();
+      });
+      autoInput.addEventListener("change", () => {
+        writeBaiduTranslateConfig({ autoTranslate: autoInput.checked });
+        syncBaiduTranslateControls(section.closest(`#${ultraPanelId}`) || section);
+      });
+      const autoCopy = document.createElement("span");
+      autoCopy.style.cssText = "display:flex;flex-direction:column;gap:2px;min-width:0";
+      const autoLabel = document.createElement("span");
+      autoLabel.setAttribute("data-ultra-baidu-auto-label", "true");
+      autoLabel.style.cssText = "font-weight:650;color:#2f2a24";
+      const autoDescription = document.createElement("span");
+      autoDescription.setAttribute("data-ultra-baidu-auto-description", "true");
+      autoDescription.style.cssText = "font-size:11px;color:#6f665d";
+      autoCopy.append(autoLabel, autoDescription);
+      autoRow.append(autoInput, autoCopy);
+      autoRow.addEventListener("click", (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        if (autoInput.disabled) {
+          return;
+        }
+        writeBaiduTranslateConfig({ autoTranslate: !readBaiduTranslateConfig().autoTranslate });
+        syncBaiduTranslateControls(section.closest(`#${ultraPanelId}`) || section);
+      });
+      autoRow.addEventListener("keydown", (event) => {
+        if (event.key !== "Enter" && event.key !== " ") {
+          return;
+        }
+        event.preventDefault();
+        event.stopPropagation();
+        if (autoInput.disabled) {
+          return;
+        }
+        writeBaiduTranslateConfig({ autoTranslate: !readBaiduTranslateConfig().autoTranslate });
+        syncBaiduTranslateControls(section.closest(`#${ultraPanelId}`) || section);
+      });
+      content.appendChild(autoRow);
+
+      const footer = document.createElement("div");
+      footer.style.cssText = "display:flex;justify-content:flex-end";
+      const clearButton = document.createElement("button");
+      clearButton.type = "button";
+      clearButton.setAttribute("data-ultra-baidu-clear", "true");
+      clearButton.style.cssText = [
+        "height:26px",
+        "border-radius:7px",
+        "border:1px solid rgba(0,0,0,.12)",
+        "background:#fff",
+        "color:#6f665d",
+        "padding:0 8px",
+        "font:600 11px/1 system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif",
+        "cursor:pointer",
+        "align-items:center",
+        "justify-content:center"
+      ].join(";");
+      clearButton.addEventListener("click", (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        writeBaiduTranslateConfig({ appId: "", secretKey: "", autoTranslate: false });
+        syncBaiduTranslateControls(section.closest(`#${ultraPanelId}`) || section);
+      });
+      footer.appendChild(clearButton);
+      content.appendChild(footer);
+      section.appendChild(content);
+      return section;
     };
 
     const syncUltraPanelControls = (panel) => {
@@ -866,6 +1528,7 @@ function injectedRuntime(config) {
           description.textContent = feature.description;
         }
       }
+      complete = syncBaiduTranslateControls(panel) && complete;
       return complete;
     };
 
@@ -945,6 +1608,7 @@ function injectedRuntime(config) {
         panel.appendChild(row);
       }
 
+      panel.appendChild(buildBaiduTranslateSection());
       syncUltraPanelControls(panel);
     };
 
@@ -1064,11 +1728,6 @@ function injectedRuntime(config) {
         button.setAttribute("aria-expanded", String(state.ultraMenuOpen));
       }
       button.style.cssText = buttonBaseStyle();
-      if (enabled) {
-        button.style.background = "#fff1e8";
-        button.style.borderColor = "#e2a37a";
-        button.style.color = "#7a3516";
-      }
 
       if (!button.isConnected) {
         if (attachmentButton) {
@@ -1079,6 +1738,487 @@ function injectedRuntime(config) {
       }
       state.ultraRoot = button;
       positionUltraPanel();
+    };
+
+    const normalizeVisibleText = (value) => String(value || "").replace(/\s+/g, " ").trim();
+
+    const isSkillDescriptionHeading = (element) => {
+      if (!(element instanceof Element)) {
+        return false;
+      }
+      const text = normalizeVisibleText(element.textContent).toLowerCase();
+      return text === "description" || text === "\u7b80\u4ecb" || text === "\u63cf\u8ff0" || text === "\u8bf4\u660e" || text === "\u4ecb\u7ecd";
+    };
+
+    const isSkillDescriptionSurface = (section) => {
+      if (!(section instanceof Element)) {
+        return false;
+      }
+      let panelText = "";
+      let current = section;
+      for (let depth = 0; current && depth < 8; depth += 1, current = current.parentElement) {
+        panelText = normalizeVisibleText(current.textContent || "");
+        if (/Added by|Last updated|Trigger|SKILL\.md|Skills?|Claude uses these descriptions|添加者|最近更新|触发|技能|简介|描述/i.test(panelText)) {
+          break;
+        }
+      }
+      const routeText = `${location.pathname || ""} ${location.hash || ""}`;
+      return (
+        /skill|skills|customize|admin-settings/i.test(routeText)
+        || /Added by|Last updated|Trigger|SKILL\.md|Skills?|Claude uses these descriptions/i.test(panelText)
+        || /添加者|最近更新|触发|技能|简介|描述/.test(panelText)
+      );
+    };
+
+    const isTranslatableSkillDescriptionTarget = (element) => {
+      if (!(element instanceof HTMLElement)) {
+        return false;
+      }
+      if (element.closest(overlayElementSelector) || element.closest("[data-claude-cn-skip]")) {
+        return false;
+      }
+      if (!visibleRect(element)) {
+        return false;
+      }
+      const text = normalizeVisibleText(element.textContent);
+      return (
+        text.length >= 8
+        && text.length <= 5000
+        && /[A-Za-z]/.test(text)
+        && !/[\u4e00-\u9fff]/.test(text)
+      );
+    };
+
+    const skillDescriptionTargetFromHeading = (heading) => {
+      const headingRow = heading.closest("div");
+      const section = headingRow?.parentElement;
+      if (!section || !isSkillDescriptionSurface(section)) {
+        return null;
+      }
+      const target = [...section.querySelectorAll("p")]
+        .find((candidate) => isTranslatableSkillDescriptionTarget(candidate));
+      return target || null;
+    };
+
+    const findSkillDescriptionTargets = () => {
+      const targets = new Set();
+      for (const heading of document.querySelectorAll("h2,h3,h4,[role='heading']")) {
+        if (!isSkillDescriptionHeading(heading)) {
+          continue;
+        }
+        const target = skillDescriptionTargetFromHeading(heading);
+        if (target) {
+          targets.add(target);
+        }
+      }
+      for (const target of document.querySelectorAll("p.whitespace-pre-wrap")) {
+        const section = target.parentElement;
+        const heading = section?.querySelector("h2,h3,h4,[role='heading']");
+        if (heading && isSkillDescriptionHeading(heading) && isSkillDescriptionSurface(section) && isTranslatableSkillDescriptionTarget(target)) {
+          targets.add(target);
+        }
+      }
+      return [...targets];
+    };
+
+    const slashSkillDescriptionText = (text) => {
+      const normalized = normalizeVisibleText(text);
+      return (
+      normalized.length >= 8
+        && normalized.length <= 2000
+        && /[A-Za-z]/.test(normalized)
+        && !/[\u4e00-\u9fff]/.test(normalized)
+        && !/^(Type to filter|Search|No results|Commands?|Skills?)$/i.test(normalized)
+      );
+    };
+
+    const slashSkillDescriptionPattern = (text) => (
+      /^\([^)]+\)\s+[A-Za-z]/.test(normalizeVisibleText(text))
+    );
+
+    const slashSkillElementText = (element) => (
+      normalizeVisibleText([
+        element.getAttribute?.("placeholder"),
+        element.getAttribute?.("aria-label"),
+        element.getAttribute?.("title"),
+        element.textContent
+      ].filter(Boolean).join(" "))
+    );
+
+    const slashSkillMenuItemText = (element) => (
+      normalizeVisibleText(element.getAttribute("aria-label") || element.textContent || "")
+    );
+
+    const isLikelySlashSkillMenu = (element) => {
+      if (!(element instanceof HTMLElement) || !visibleRect(element)) {
+        return false;
+      }
+      const items = [...element.querySelectorAll("[role='menuitem'],[role='option']")]
+        .map(slashSkillMenuItemText)
+        .filter(Boolean);
+      if (items.length < 1) {
+        return false;
+      }
+      const commandLikeItems = items.filter((text) => /^[a-z0-9][a-z0-9:_-]{1,}$/i.test(text));
+      return commandLikeItems.length >= Math.min(2, items.length);
+    };
+
+    const visibleSlashSkillFilterElements = () => (
+      [...document.querySelectorAll("input,textarea,[role='textbox'],[placeholder],[aria-label]")]
+        .filter((element) => {
+          if (!(element instanceof HTMLElement) || !visibleRect(element)) {
+            return false;
+          }
+          const text = slashSkillElementText(element);
+          return text.length <= 500 && /\bType to filter\b|输入.*筛选|筛选技能/i.test(text);
+        })
+    );
+
+    const visibleSlashSkillFilterSurfaces = () => {
+      const surfaces = new Set();
+      for (const filter of visibleSlashSkillFilterElements()) {
+        let current = filter;
+        for (let depth = 0; current && depth < 8; depth += 1, current = current.parentElement) {
+          if (!(current instanceof HTMLElement) || current === document.body || current === document.documentElement) {
+            break;
+          }
+          const rect = visibleRect(current);
+          if (!rect) {
+            continue;
+          }
+          const itemTexts = [...current.querySelectorAll("[role='menuitem'],[role='option'],[aria-selected],button")]
+            .map(slashSkillMenuItemText)
+            .filter(Boolean);
+          const commandLikeItems = itemTexts.filter((text) => /^[a-z0-9][a-z0-9:_-]{1,}$/i.test(text));
+          const looksLikeFloatingPanel = (
+            rect.width >= 220
+            && rect.width <= Math.min(window.innerWidth || 1200, 960)
+            && rect.height >= 120
+            && rect.height <= Math.min(window.innerHeight || 900, 900)
+          );
+          if (looksLikeFloatingPanel && (commandLikeItems.length >= 2 || depth >= 2)) {
+            surfaces.add(current);
+          }
+        }
+      }
+      return [...surfaces].filter((surface) => (
+        ![...surfaces].some((other) => other !== surface && other.contains(surface))
+      ));
+    };
+
+    const visibleSlashSkillMenus = () => (
+      [
+        ...new Set([
+          ...[...document.querySelectorAll("[role='menu']")].filter(isLikelySlashSkillMenu),
+          ...visibleSlashSkillFilterSurfaces()
+        ])
+      ]
+    );
+
+    const hasSlashTooltipClassContext = (element) => {
+      let current = element;
+      for (let depth = 0; current && depth < 6; depth += 1, current = current.parentElement) {
+        const className = String(current.getAttribute("class") || "");
+        if (/line-clamp|bg-always-black|text-always-white|pointer-events-none|backdrop-blur|text-pretty/.test(className)) {
+          return true;
+        }
+      }
+      return false;
+    };
+
+    const visibleSlashSkillHoverTooltips = () => (
+      [...document.querySelectorAll([
+        "[role='tooltip']",
+        "[class*='line-clamp']",
+        "[class*='bg-always-black']",
+        "[class*='text-always-white']",
+        "[class*='pointer-events-none']",
+        "[class*='backdrop-blur']"
+      ].join(","))]
+        .filter((element) => {
+          if (!(element instanceof HTMLElement) || element.closest(overlayElementSelector) || element.closest("[data-claude-cn-skip]")) {
+            return false;
+          }
+          const rect = visibleRect(element);
+          if (!rect || rect.width < 120 || rect.width > 960 || rect.height < 12 || rect.height > 280) {
+            return false;
+          }
+          const text = normalizeVisibleText(element.textContent);
+          return slashSkillDescriptionText(text) && slashSkillDescriptionPattern(text) && hasSlashTooltipClassContext(element);
+        })
+    );
+
+    const slashSkillContextVisible = () => (
+      visibleSlashSkillMenus().length > 0
+      || visibleSlashSkillFilterElements().length > 0
+      || visibleSlashSkillHoverTooltips().length > 0
+    );
+
+    const verticallyOverlaps = (left, right) => (
+      Math.min(left.bottom, right.bottom) - Math.max(left.top, right.top) > 4
+    );
+
+    const isNearSlashSkillMenu = (element) => {
+      const rect = visibleRect(element);
+      if (!rect) {
+        return false;
+      }
+      return visibleSlashSkillMenus().some((menu) => {
+        const menuRect = visibleRect(menu);
+        if (!menuRect) {
+          return false;
+        }
+        return (
+          verticallyOverlaps(rect, menuRect)
+          && rect.left >= menuRect.left - 28
+          && rect.left <= menuRect.right + 760
+          && rect.right >= menuRect.left
+        );
+      });
+    };
+
+    const isSlashSkillHoverTextPosition = (element) => {
+      const rect = visibleRect(element);
+      if (!rect) {
+        return false;
+      }
+      return visibleSlashSkillMenus().some((menu) => {
+        const menuRect = visibleRect(menu);
+        if (!menuRect) {
+          return false;
+        }
+        const isRightPreview = (
+          rect.left >= menuRect.right - 18
+          && rect.left <= menuRect.right + 900
+          && verticallyOverlaps(rect, menuRect)
+        );
+        const isCompactPreview = (
+          rect.left >= menuRect.left - 24
+          && rect.right <= menuRect.right + 900
+          && rect.top >= menuRect.top - 24
+          && rect.bottom <= menuRect.bottom + 24
+          && rect.width >= 120
+        );
+        return isRightPreview || isCompactPreview;
+      });
+    };
+
+    const slashTooltipClassContext = (element) => {
+      return hasSlashTooltipClassContext(element);
+    };
+
+    const isSlashSkillHoverDescriptionTarget = (element) => {
+      if (!(element instanceof HTMLElement)) {
+        return false;
+      }
+      if (element.closest(overlayElementSelector) || element.closest("[data-claude-cn-skip]") || element.closest("textarea,[contenteditable='true'],[role='textbox']")) {
+        return false;
+      }
+      const rect = visibleRect(element);
+      if (!rect) {
+        return false;
+      }
+      const text = normalizeVisibleText(element.textContent);
+      if (element.matches("[role='menu']") || element.querySelector("[role='menuitem'],[role='option'],input,textarea,[contenteditable='true'],[role='textbox']")) {
+        return false;
+      }
+      const targetShape = rect.width >= 120 && rect.width <= 960 && rect.height >= 12 && rect.height <= 280;
+      return (
+        targetShape
+        &&
+        slashSkillDescriptionText(text)
+        && (
+          (isSlashSkillHoverTextPosition(element) && !element.querySelector("[role='menu']"))
+          || (slashTooltipClassContext(element) && (isNearSlashSkillMenu(element) || slashSkillDescriptionPattern(text)))
+          || slashSkillDescriptionPattern(text)
+        )
+      );
+    };
+
+    const slashSkillFullDescriptionTarget = (element) => {
+      let current = element;
+      for (let depth = 0; current && depth < 5; depth += 1, current = current.parentElement) {
+        if (!(current instanceof HTMLElement) || current === document.body || current === document.documentElement) {
+          break;
+        }
+        if (isSlashSkillHoverDescriptionTarget(current) && slashSkillDescriptionPattern(current.textContent)) {
+          return current;
+        }
+      }
+      return element;
+    };
+
+    const findSlashSkillHoverDescriptionTargets = () => {
+      if (!slashSkillContextVisible()) {
+        return [];
+      }
+      const candidates = new Set(visibleSlashSkillHoverTooltips());
+
+      const targets = new Set();
+      for (const candidate of candidates) {
+        const nestedLineClampTargets = candidate.querySelectorAll
+          ? [...candidate.querySelectorAll("[class*='line-clamp']")]
+          : [];
+        const lineClampTarget = candidate.matches?.("[class*='line-clamp']")
+          ? candidate
+          : nestedLineClampTargets.find(isSlashSkillHoverDescriptionTarget);
+        const target = slashSkillFullDescriptionTarget(lineClampTarget || candidate);
+        if (isSlashSkillHoverDescriptionTarget(target)) {
+          targets.add(target);
+        }
+      }
+      return [...targets].filter((target) => (
+        ![...targets].some((other) => other !== target && target.contains(other))
+      ));
+    };
+
+    const skillTranslateButtonStyle = () => [
+      "height:22px",
+      "border-radius:6px",
+      "border:1px solid rgba(0,0,0,.12)",
+      "background:#fff",
+      "color:#7a3516",
+      "padding:0 7px",
+      "font:650 11px/1 system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif",
+      "cursor:pointer",
+      "display:inline-flex",
+      "align-items:center",
+      "justify-content:center",
+      "white-space:nowrap"
+    ].join(";");
+
+    const translateSkillDescriptionElement = async (target, button) => {
+      const original = normalizedSkillTranslationSource(target.textContent || "");
+      if (!original) {
+        return false;
+      }
+      recordSkillTranslateDebug({ phase: "start", text: original });
+      const cached = cachedSkillTranslation(original);
+      if (cached) {
+        target.setAttribute(skillTranslateTargetMarker, "true");
+        target.setAttribute("data-claude-cn-skip", "true");
+        target.removeAttribute("data-claude-ultra-skill-auto");
+        target.removeAttribute("data-claude-ultra-skill-error");
+        target.textContent = cached;
+        recordSkillTranslateDebug({ phase: "cached", text: original });
+        if (button) {
+          button.textContent = ultraText("translatedSkillDescription");
+        }
+        return true;
+      }
+      if (button) {
+        button.disabled = true;
+        button.style.cursor = "default";
+        button.textContent = ultraText("translatingSkillDescription");
+      }
+      try {
+        const translated = await translateWithBaidu(original);
+        rememberSkillTranslation(original, translated);
+        target.setAttribute(skillTranslateTargetMarker, "true");
+        target.setAttribute("data-claude-cn-skip", "true");
+        target.removeAttribute("data-claude-ultra-skill-auto");
+        target.removeAttribute("data-claude-ultra-skill-error");
+        target.textContent = translated;
+        recordSkillTranslateDebug({ phase: "translated", text: original });
+        if (button) {
+          button.textContent = ultraText("translatedSkillDescription");
+        }
+        return true;
+      } catch (error) {
+        const errorText = String(error?.message || error || ultraText("translateFailed"));
+        target.setAttribute("data-claude-ultra-skill-error", errorText.slice(0, 300));
+        recordSkillTranslateDebug({ phase: "failed", text: original, error: errorText });
+        if (button) {
+          button.disabled = false;
+          button.style.cursor = "pointer";
+          button.textContent = ultraText("translateFailed");
+          button.title = errorText || ultraText("translateFailed");
+          setTimeout(() => {
+            if (button.isConnected) {
+              button.textContent = ultraText("translateSkillDescription");
+            }
+          }, 2200);
+        }
+        return false;
+      }
+    };
+
+    const autoTranslateSkillDescriptionTarget = async (target) => {
+      if (state.skillAutoTranslatePending.has(target) || target.getAttribute("data-claude-ultra-skill-auto") === "failed") {
+        return;
+      }
+      state.skillAutoTranslatePending.add(target);
+      target.setAttribute("data-claude-ultra-skill-auto", "pending");
+      const translated = await translateSkillDescriptionElement(target, null);
+      state.skillAutoTranslatePending.delete(target);
+      if (!translated && target.isConnected && target.getAttribute("data-claude-ultra-skill-auto") === "pending") {
+        target.setAttribute("data-claude-ultra-skill-auto", "failed");
+      }
+    };
+
+    const ensureSkillDescriptionTranslateButton = (target) => {
+      const section = target.parentElement;
+      const heading = section?.querySelector("h2,h3,h4,[role='heading']");
+      const headingRow = heading?.closest("div") || section;
+      if (!headingRow) {
+        return;
+      }
+
+      let button = [...document.querySelectorAll(`[${skillTranslateMarker}]`)]
+        .find((candidate) => candidate.__claudeUltraSkillTranslateTarget === target);
+      if (!button) {
+        button = document.createElement("button");
+        button.type = "button";
+        button.setAttribute(skillTranslateMarker, "true");
+        button.setAttribute("data-claude-cn-skip", "true");
+        button.style.cssText = skillTranslateButtonStyle();
+        button.addEventListener("click", (event) => {
+          event.preventDefault();
+          event.stopPropagation();
+          translateSkillDescriptionElement(target, button);
+        });
+        button.addEventListener("keydown", (event) => {
+          event.stopPropagation();
+        });
+      }
+
+      button.__claudeUltraSkillTranslateTarget = target;
+      const label = ultraText("translateSkillDescription");
+      if (!button.disabled && button.textContent !== label) {
+        button.textContent = label;
+      }
+      if (button.title !== label) {
+        button.title = label;
+      }
+      if (!button.isConnected || button.parentElement !== headingRow) {
+        headingRow.appendChild(button);
+      }
+    };
+
+    const renderSkillDescriptionTranslateButtons = () => {
+      if (!document.body) {
+        return;
+      }
+      const configured = hasBaiduTranslateConfig();
+      const autoTranslate = isBaiduAutoTranslateEnabled();
+      const detailTargets = configured ? new Set(findSkillDescriptionTargets()) : new Set();
+      const slashHoverTargets = autoTranslate ? new Set(findSlashSkillHoverDescriptionTargets()) : new Set();
+      for (const button of document.querySelectorAll(`[${skillTranslateMarker}]`)) {
+        const target = button.__claudeUltraSkillTranslateTarget;
+        if (!target || !target.isConnected || !detailTargets.has(target) || autoTranslate) {
+          button.remove();
+        }
+      }
+      for (const target of detailTargets) {
+        if (autoTranslate) {
+          autoTranslateSkillDescriptionTarget(target);
+        } else {
+          ensureSkillDescriptionTranslateButton(target);
+        }
+      }
+      for (const target of slashHoverTargets) {
+        autoTranslateSkillDescriptionTarget(target);
+      }
     };
 
     const processRootInternal = (root) => {
@@ -1126,6 +2266,7 @@ function injectedRuntime(config) {
         renderLanguageCard();
         renderUltraMenu();
         renderUltraPanel();
+        renderSkillDescriptionTranslateButtons();
       });
     };
 
@@ -1136,6 +2277,7 @@ function injectedRuntime(config) {
         renderLanguageCard();
         renderUltraMenu();
         renderUltraPanel();
+        renderSkillDescriptionTranslateButtons();
       }
     };
 
@@ -1254,6 +2396,7 @@ function injectedRuntime(config) {
           renderLanguageCard();
           renderUltraMenu();
           renderUltraPanel();
+          renderSkillDescriptionTranslateButtons();
         });
       });
 

@@ -10,8 +10,8 @@ const RUNTIME_ZIP = "electron-runtime-win32-x64-41.5.0.zip";
 const ASAR_JSON_OFFSET = 16;
 const ASAR_HEADER_SIZE_OFFSET = 4;
 const ASAR_STRING_SIZE_OFFSET = 12;
-const PRELOAD_PATCH_MARKER = "CLAUDE_CN_PRELOAD_PATCH";
-const MAIN_PROCESS_PATCH_MARKER = "CLAUDE_CN_MAIN_PROCESS_PATCH_V8_ULTRA_MENU";
+const PRELOAD_PATCH_MARKER = "CLAUDE_CN_PRELOAD_PATCH_V7_BAIDU_TRANSLATE_BRIDGE";
+const MAIN_PROCESS_PATCH_MARKER = "CLAUDE_CN_MAIN_PROCESS_PATCH_V13_BAIDU_TRANSLATE_BRIDGE";
 const ULTRA_MAX_EFFORT_PATCH_MARKER = "CLAUDE_ULTRA_MAX_EFFORT_PATCH";
 const NATIVE_LANGUAGE_LIST_PATCH_MARKER = "CLAUDE_ULTRA_NATIVE_LANGUAGE_LIST_PATCH";
 const CODE_ORG_DISABLED_GATE_PATCH_MARKER = "CLAUDE_ULTRA_CODE_ORG_DISABLED_GATE_PATCH";
@@ -64,6 +64,7 @@ function isCompleteMacRuntimeStatus(status, expectedInjectionHash = null) {
       && status?.asarIntegrityStats?.patched > 0
       && status?.signingStats?.signed === true
       && status?.mainProcessPatchMarker === MAIN_PROCESS_PATCH_MARKER
+      && status?.preloadPatchMarker === PRELOAD_PATCH_MARKER
       && (!expectedInjectionHash || status?.injectionHash === expectedInjectionHash)
   );
 }
@@ -357,13 +358,40 @@ async function findRuntimeZip(rootDir) {
     path.join(process.cwd(), "vendor", RUNTIME_ZIP)
   ];
 
+  const invalidCandidates = [];
   for (const candidate of candidates) {
     if (await pathExists(candidate)) {
-      return candidate;
+      try {
+        await assertRuntimeZipFile(candidate);
+        return candidate;
+      } catch (error) {
+        invalidCandidates.push(`${candidate}: ${error.message}`);
+      }
     }
   }
 
+  if (invalidCandidates.length > 0) {
+    throw new Error(`Electron runtime zip is invalid or incomplete. ${invalidCandidates.join(" | ")}`);
+  }
+
   throw new Error(`缺少便携 Electron 运行时资源：${candidates.join(" 或 ")}`);
+}
+
+async function assertRuntimeZipFile(zipPath) {
+  const stat = await fs.stat(zipPath);
+  if (stat.size < 50 * 1024 * 1024) {
+    throw new Error(`Electron runtime zip is incomplete: ${zipPath} is only ${stat.size} bytes. Make sure Git LFS assets were downloaded, or use a complete release package.`);
+  }
+  const handle = await fs.open(zipPath, "r");
+  try {
+    const header = Buffer.alloc(4);
+    await handle.read(header, 0, header.length, 0);
+    if (header[0] !== 0x50 || header[1] !== 0x4b) {
+      throw new Error(`Electron runtime zip is invalid: ${zipPath} is not a ZIP file. Make sure Git LFS assets were downloaded, or use a complete release package.`);
+    }
+  } finally {
+    await handle.close();
+  }
 }
 
 async function materializeRuntimeZip(rootDir, runtimeDir) {
@@ -708,7 +736,69 @@ try {
 `;
 }
 
-function buildMainProcessPatch(injectionSource) {
+function buildBaiduTranslateBridgePreloadPatch() {
+  return `
+;/* ${PRELOAD_PATCH_MARKER} */
+try {
+  if (!globalThis.__CLAUDE_ULTRA_BAIDU_BRIDGE_PRELOAD__) {
+    const { contextBridge, ipcRenderer } = require("electron");
+    const ultraSettingsKey = "__claude_ultra_features__";
+    const requestMessage = "__CLAUDE_ULTRA_BAIDU_TRANSLATE_REQUEST__";
+    const responseMessage = "__CLAUDE_ULTRA_BAIDU_TRANSLATE_RESPONSE__";
+    const readBaiduTranslateConfig = (payload) => {
+      let settings = {};
+      try {
+        settings = JSON.parse(localStorage.getItem(ultraSettingsKey) || "{}") || {};
+      } catch {}
+      const configValue = settings.baiduTranslate && typeof settings.baiduTranslate === "object"
+        ? settings.baiduTranslate
+        : {};
+      return {
+        appId: String(payload?.appId || configValue.appId || settings.baiduTranslateAppId || "").trim(),
+        secretKey: String(payload?.secretKey || configValue.secretKey || settings.baiduTranslateSecretKey || "").trim()
+      };
+    };
+    const invokeTranslate = (payload = {}) => {
+      const config = readBaiduTranslateConfig(payload);
+      return ipcRenderer.invoke("__claude_ultra_baidu_translate__", {
+        text: payload.text,
+        appId: config.appId,
+        secretKey: config.secretKey
+      });
+    };
+    const bridge = {
+      translate(payload) {
+        return invokeTranslate(payload);
+      }
+    };
+    globalThis.__CLAUDE_ULTRA_BAIDU_BRIDGE_PRELOAD__ = true;
+    globalThis.__CLAUDE_ULTRA_BAIDU_BRIDGE__ = bridge;
+    window.addEventListener("message", async (event) => {
+      const data = event?.data;
+      if (event.source !== window || !data || data.source !== requestMessage || !data.id) {
+        return;
+      }
+      try {
+        const translated = await invokeTranslate(data.payload || {});
+        window.postMessage({ source: responseMessage, id: data.id, ok: true, translated }, "*");
+      } catch (error) {
+        window.postMessage({
+          source: responseMessage,
+          id: data.id,
+          ok: false,
+          error: String(error?.message || error || "Baidu Translate failed.")
+        }, "*");
+      }
+    });
+    contextBridge.exposeInMainWorld("__CLAUDE_ULTRA_BAIDU_BRIDGE__", bridge);
+  }
+} catch (error) {
+  try { console.warn("[claude-cn] baidu translate bridge preload failed", error); } catch {}
+}
+`;
+}
+
+export function buildMainProcessPatch(injectionSource) {
   const evaluatedSource = `;(() => {
   let injectError = null;
   try {
@@ -734,8 +824,10 @@ function buildMainProcessPatch(injectionSource) {
   return `
 ;/* ${MAIN_PROCESS_PATCH_MARKER} */
 try {
-  const { app } = require("electron");
+  const { app, ipcMain, net } = require("electron");
+  const crypto = require("node:crypto");
   const fs = require("node:fs");
+  const https = require("node:https");
   const os = require("node:os");
   const path = require("node:path");
   const source = ${JSON.stringify(evaluatedSource)};
@@ -762,6 +854,165 @@ try {
       }
     } catch {}
   };
+  const baiduTranslateOrigin = "https://fanyi-api.baidu.com";
+  const baiduTranslateEndpoint = baiduTranslateOrigin + "/api/trans/vip/translate";
+  const baiduHttpJson = (url) => new Promise((resolve, reject) => {
+    const request = https.get(url, {
+      headers: {
+        "Accept": "application/json",
+        "User-Agent": "Claude-Ultra/1.0"
+      },
+      timeout: 15000
+    }, (response) => {
+      let body = "";
+      response.setEncoding("utf8");
+      response.on("data", (chunk) => {
+        body += chunk;
+      });
+      response.on("end", () => {
+        if (response.statusCode < 200 || response.statusCode >= 300) {
+          reject(new Error("Baidu Translate HTTP " + response.statusCode));
+          return;
+        }
+        try {
+          resolve(JSON.parse(body));
+        } catch (error) {
+          reject(new Error("Baidu Translate returned invalid JSON."));
+        }
+      });
+    });
+    request.on("timeout", () => {
+      request.destroy(new Error("Baidu Translate request timed out."));
+    });
+    request.on("error", reject);
+  });
+  const baiduResponseJson = async (response) => {
+    if (!response.ok) {
+      throw new Error("Baidu Translate HTTP " + response.status);
+    }
+    return response.json();
+  };
+  const baiduTranslateJson = async (url) => {
+    const failures = [];
+    if (typeof fetch === "function") {
+      try {
+        return await baiduResponseJson(await fetch(url, { method: "GET" }));
+      } catch (error) {
+        failures.push("fetch: " + String(error?.message || error));
+      }
+    }
+    if (net?.fetch) {
+      try {
+        return await baiduResponseJson(await net.fetch(url, { method: "GET" }));
+      } catch (error) {
+        failures.push("net.fetch: " + String(error?.message || error));
+      }
+    }
+    try {
+      return await baiduHttpJson(url);
+    } catch (error) {
+      failures.push("https: " + String(error?.message || error));
+      throw new Error(failures.join("; ") || "Baidu Translate request failed.");
+    }
+  };
+  const installBaiduTranslateIpcBridge = () => {
+    try {
+      if (globalThis.__CLAUDE_ULTRA_BAIDU_TRANSLATE_IPC_BRIDGE__) return;
+      globalThis.__CLAUDE_ULTRA_BAIDU_TRANSLATE_IPC_BRIDGE__ = true;
+      ipcMain.handle("__claude_ultra_baidu_translate__", async (_event, payload) => {
+        const appId = String(payload?.appId || "").trim();
+        const secretKey = String(payload?.secretKey || "").trim();
+        const query = String(payload?.text || "").trim().slice(0, 5000);
+        if (!appId || !secretKey) {
+          throw new Error("Baidu Translate API is not configured.");
+        }
+        if (!query) {
+          return query;
+        }
+        const salt = String(Date.now()) + String(Math.floor(Math.random() * 100000));
+        const sign = crypto.createHash("md5").update(appId + query + salt + secretKey, "utf8").digest("hex");
+        const params = new URLSearchParams({
+          q: query,
+          from: "auto",
+          to: "zh",
+          appid: appId,
+          salt,
+          sign
+        });
+        const result = await baiduTranslateJson(baiduTranslateEndpoint + "?" + params.toString());
+        if (result?.error_code) {
+          throw new Error(result.error_msg || ("Baidu Translate error " + result.error_code));
+        }
+        const lines = Array.isArray(result?.trans_result)
+          ? result.trans_result.map((item) => item?.dst).filter(Boolean)
+          : [];
+        if (lines.length === 0) {
+          throw new Error("Baidu Translate returned no result.");
+        }
+        return lines.join("\\n");
+      });
+      writeStatus({ reason: "baidu-translate-ipc-installed" });
+    } catch (error) {
+      writeStatus({ reason: "baidu-translate-ipc-failed", error: String(error) });
+    }
+  };
+  const installBaiduTranslateCorsPatch = () => {
+    try {
+      if (globalThis.__CLAUDE_ULTRA_BAIDU_TRANSLATE_CORS_PATCH__) return;
+      const { session } = require("electron");
+      const webRequest = session?.defaultSession?.webRequest;
+      if (!webRequest?.onHeadersReceived) return;
+      globalThis.__CLAUDE_ULTRA_BAIDU_TRANSLATE_CORS_PATCH__ = true;
+      const allowBaiduInCsp = (value) => {
+        const directives = String(value || "").split(";").map((part) => part.trim()).filter(Boolean);
+        const index = directives.findIndex((part) => part.toLowerCase().startsWith("connect-src"));
+        if (index >= 0) {
+          const pieces = directives[index].split(/\s+/).filter(Boolean);
+          if (!pieces.includes(baiduTranslateOrigin)) {
+            pieces.push(baiduTranslateOrigin);
+          }
+          directives[index] = pieces.join(" ");
+        } else {
+          directives.push("connect-src 'self' https: data: blob: " + baiduTranslateOrigin);
+        }
+        return directives.join("; ");
+      };
+      webRequest.onHeadersReceived({ urls: ["<all_urls>"] }, (details, callback) => {
+        const responseHeaders = { ...(details.responseHeaders || {}) };
+        const setHeader = (name, value) => {
+          const existing = Object.keys(responseHeaders).find((key) => key.toLowerCase() === name.toLowerCase()) || name;
+          responseHeaders[existing] = [value];
+        };
+        const patchCspHeader = (name) => {
+          const existing = Object.keys(responseHeaders).find((key) => key.toLowerCase() === name.toLowerCase());
+          if (!existing) return;
+          const values = Array.isArray(responseHeaders[existing]) ? responseHeaders[existing] : [String(responseHeaders[existing])];
+          responseHeaders[existing] = values.map(allowBaiduInCsp);
+        };
+        patchCspHeader("Content-Security-Policy");
+        patchCspHeader("Content-Security-Policy-Report-Only");
+        if (String(details.url || "").startsWith(baiduTranslateOrigin + "/")) {
+          setHeader("Access-Control-Allow-Origin", "*");
+          setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
+          setHeader("Access-Control-Allow-Headers", "*");
+        }
+        callback({ responseHeaders });
+      });
+      writeStatus({ reason: "baidu-translate-network-installed" });
+    } catch (error) {
+      writeStatus({ reason: "baidu-translate-network-failed", error: String(error) });
+    }
+  };
+  installBaiduTranslateIpcBridge();
+  try {
+    if (app.isReady?.()) {
+      installBaiduTranslateCorsPatch();
+    } else {
+      app.whenReady?.().then(installBaiduTranslateCorsPatch).catch((error) => {
+        writeStatus({ reason: "baidu-translate-network-ready-failed", error: String(error) });
+      });
+    }
+  } catch {}
   const inject = (webContents, reason) => {
     try {
       if (!webContents || webContents.isDestroyed()) return;
@@ -871,9 +1122,12 @@ async function patchPreloadScripts(resourcesDir, injectionSource) {
   }
 
   const append = buildPreloadPatch(injectionSource);
+  const bridgeAppend = buildBaiduTranslateBridgePreloadPatch();
+  const bridgeAndInjectionAppend = `${bridgeAppend}${append}`;
   return patchAsarFile(asarPath, [
-    { file: ".vite/build/mainView.js", append, marker: PRELOAD_PATCH_MARKER },
-    { file: ".vite/build/mainWindow.js", append, marker: PRELOAD_PATCH_MARKER }
+    { file: ".vite/build/index.pre.js", append: bridgeAppend, marker: PRELOAD_PATCH_MARKER },
+    { file: ".vite/build/mainView.js", append: bridgeAndInjectionAppend, marker: PRELOAD_PATCH_MARKER },
+    { file: ".vite/build/mainWindow.js", append: bridgeAndInjectionAppend, marker: PRELOAD_PATCH_MARKER }
   ]);
 }
 
@@ -1266,6 +1520,7 @@ export async function preparePortableRuntime(rootDir, app, dictionary, options =
   const runtimeDir = runtimeRootFor(app);
   const runtimeExe = await ensureElectronRuntime(rootDir, runtimeDir);
   const resourcesDir = path.join(runtimeDir, "resources");
+  const injectionHash = options.injectionSource ? sha256(Buffer.from(options.injectionSource, "utf8")) : null;
 
   await fs.mkdir(resourcesDir, { recursive: true });
   await retryBusyFileOperation(() => fs.cp(app.resourcesDir, resourcesDir, { recursive: true, force: true }));
@@ -1285,6 +1540,9 @@ export async function preparePortableRuntime(rootDir, app, dictionary, options =
         sourcePackage: app.packageFullName,
         sourceVersion: app.version,
         electronVersion: ELECTRON_VERSION,
+        injectionHash,
+        mainProcessPatchMarker: MAIN_PROCESS_PATCH_MARKER,
+        preloadPatchMarker: PRELOAD_PATCH_MARKER,
         iconStats,
         localeStats,
         effortStats,
@@ -1309,7 +1567,8 @@ export async function preparePortableRuntime(rootDir, app, dictionary, options =
     nativeLanguageStats,
     compatibilityStats,
     mainProcessStats,
-    preloadStats
+    preloadStats,
+    injectionHash
   };
 }
 
@@ -1392,6 +1651,7 @@ export async function prepareMacPortableRuntime(rootDir, app, dictionary, option
         runtimeApp,
         injectionHash,
         mainProcessPatchMarker: MAIN_PROCESS_PATCH_MARKER,
+        preloadPatchMarker: PRELOAD_PATCH_MARKER,
         localeStats,
         effortStats,
         nativeLanguageStats,

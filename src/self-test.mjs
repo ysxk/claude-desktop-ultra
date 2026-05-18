@@ -11,6 +11,7 @@ import { loadProfile } from "./locale.mjs";
 import {
   applyCodeOrgDisabledGatePatch,
   applyMaxEffortPatchRules,
+  buildMainProcessPatch,
   patchMacDesktopUserAgent,
   patchUltraLocalBridge,
   prepareMacPortableRuntime,
@@ -672,6 +673,114 @@ function testUltraMenuStableInteraction(recorder) {
     "Ultra outside-click listener uses the current root button",
     source.includes("state.ultraRoot?.contains(event.target)")
   );
+  recorder.check(
+    "1M 开启后 Ultra 按钮不再额外变色",
+    !source.includes('button.style.borderColor = "#e2a37a"')
+      && !source.includes('button.style.background = "#fff1e8"')
+      && !source.includes('button.style.color = "#7a3516"')
+  );
+}
+
+function testBaiduSkillDescriptionTranslation(recorder) {
+  const source = buildInjectionSource({
+    dictionary: {},
+    profile: {
+      locale: "zh-CN",
+      fallbackLocale: "en-US",
+      translateAttributes: [],
+      skipTextSelectors: []
+    },
+    launchLocale: "zh-CN",
+    localeOverride: true
+  });
+
+  recorder.check(
+    "Ultra 菜单包含百度翻译 API 配置项",
+    source.includes("baiduTranslate")
+      && source.includes("data-ultra-baidu-app-id")
+      && source.includes("data-ultra-baidu-secret-key")
+  );
+  recorder.check(
+    "百度翻译配置区会折叠成下拉面板",
+    source.includes("data-ultra-baidu-toggle")
+      && source.includes("data-ultra-baidu-content")
+      && source.includes("data-ultra-baidu-chevron")
+  );
+  recorder.check(
+    "百度翻译配置包含技能简介自动翻译开关",
+    source.includes("autoTranslate")
+      && source.includes("data-ultra-baidu-auto")
+      && source.includes("isBaiduAutoTranslateEnabled")
+  );
+  recorder.check(
+    "百度翻译请求会用 App ID、salt 和密钥生成 MD5 签名",
+    source.includes("https://fanyi-api.baidu.com/api/trans/vip/translate")
+      && source.includes("md5Hex(`${config.appId}${query}${salt}${config.secretKey}`)")
+  );
+  recorder.check(
+    "技能简介翻译按钮定位到 DescriptionRow 的简介正文",
+    source.includes("p.whitespace-pre-wrap")
+      && source.includes("skillDescriptionTargetFromHeading")
+      && source.includes("data-claude-ultra-skill-description")
+  );
+  recorder.check(
+    "技能简介自动翻译会处理聊天 / 菜单的悬停介绍",
+    source.includes("findSlashSkillHoverDescriptionTargets")
+      && source.includes("isLikelySlashSkillMenu")
+      && source.includes("visibleSlashSkillFilterElements")
+      && source.includes("visibleSlashSkillFilterSurfaces")
+      && source.includes("visibleSlashSkillHoverTooltips")
+      && source.includes("slashSkillContextVisible")
+      && source.includes("hasSlashTooltipClassContext")
+      && source.includes("slashSkillDescriptionPattern")
+      && source.includes("slashSkillFullDescriptionTarget")
+      && source.includes("isSlashSkillHoverTextPosition")
+      && source.includes("rect.left >= menuRect.right - 18")
+      && source.includes("[class*='line-clamp']")
+      && source.includes("[class*='bg-always-black']")
+      && source.includes("[class*='pointer-events-none']")
+      && source.includes("new Set(visibleSlashSkillHoverTooltips())")
+      && !source.includes("[role='textbox'],[placeholder],[aria-label],div,span,p")
+      && source.includes("^\\([^)]+\\)\\s+[A-Za-z]")
+  );
+  recorder.check(
+    "技能简介自动翻译会缓存悬停简介译文并暴露无密钥调试信息",
+    source.includes("__claude_ultra_baidu_skill_cache__")
+      && source.includes("__claude_ultra_baidu_skill_debug__")
+      && source.includes("cachedSkillTranslation")
+      && source.includes("rememberSkillTranslation")
+      && source.includes("recordSkillTranslateDebug")
+      && source.includes("debugSkillDescriptions")
+      && source.includes("lastTranslateDebug")
+      && source.includes("hasBaiduConfig")
+      && source.includes("__CLAUDE_ULTRA_BAIDU_BRIDGE__")
+      && source.includes("translateWithBaiduWindowBridge")
+      && source.includes("__CLAUDE_ULTRA_BAIDU_TRANSLATE_REQUEST__")
+      && source.includes("baidu-direct-bridge-failed")
+      && source.includes("baidu-renderer-fetch-failed")
+  );
+  recorder.check(
+    "技能简介自动翻译开启后不显示手动按钮",
+    source.includes("const autoTranslate = isBaiduAutoTranslateEnabled();")
+      && source.includes("autoTranslateSkillDescriptionTarget(target);")
+      && source.includes("button.remove();")
+      && source.includes("ensureSkillDescriptionTranslateButton(target);")
+  );
+
+  const mainPatch = buildMainProcessPatch(source);
+  recorder.check(
+    "百度翻译请求会在 Ultra 运行时补齐 CORS 响应头",
+    mainPatch.includes("https://fanyi-api.baidu.com")
+      && mainPatch.includes("ipcMain.handle(\"__claude_ultra_baidu_translate__\"")
+      && mainPatch.includes("createHash(\"md5\")")
+      && mainPatch.includes("require(\"node:https\")")
+      && mainPatch.includes("net.fetch")
+      && mainPatch.includes("baiduTranslateJson")
+      && mainPatch.includes("Access-Control-Allow-Origin")
+      && mainPatch.includes("Content-Security-Policy")
+      && mainPatch.includes("connect-src")
+      && mainPatch.includes("onHeadersReceived")
+  );
 }
 
 function testUltraLocalBridgePatch(recorder) {
@@ -755,6 +864,7 @@ async function testPortableRuntime(recorder, rootDir, flags = {}) {
   const modelMenuReversalLeaks = await findModelMenuSectionReversalLeaks(runtime.resourcesDir);
   recorder.check("模型菜单仍使用 Claude 原生主列表", modelMenuReversalLeaks.length === 0, modelMenuReversalLeaks.join(", "));
   recorder.check("运行时状态记录 Max 规则", Array.isArray(runtimeStatus.effortStats?.rules) && runtimeStatus.effortStats.rules.length > 0);
+  recorder.check("运行时状态记录注入 hash 和补丁标记", typeof runtimeStatus.injectionHash === "string" && runtimeStatus.injectionHash.length === 64 && Boolean(runtimeStatus.mainProcessPatchMarker) && Boolean(runtimeStatus.preloadPatchMarker));
   recorder.check("主进程汉化注入已写入", runtime.mainProcessStats.patched > 0);
   recorder.check("preload 汉化注入已写入", runtime.preloadStats.patched > 0);
   recorder.check("便携兼容补丁已写入", runtime.compatibilityStats.patched > 0);
@@ -791,6 +901,7 @@ export async function runWindowsSelfTest({ rootDir, flags = {}, logger = console
     testUltraMenuI18n(recorder);
     testUltraMenuPrefersComposerAddButton(recorder);
     testUltraMenuStableInteraction(recorder);
+    testBaiduSkillDescriptionTranslation(recorder);
     testUltraLocalBridgePatch(recorder);
     testCodeOrgDisabledGatePatch(recorder);
     testMacDesktopUserAgentPatch(recorder);

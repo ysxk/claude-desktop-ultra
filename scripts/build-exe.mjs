@@ -8,6 +8,7 @@ const rootDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..")
 const distDir = path.join(rootDir, "dist");
 const exePath = path.join(distDir, "ClaudeCN.exe");
 const hookPath = path.join(rootDir, "scripts", "pkg-icon-hook.cjs");
+const runtimeZipPath = path.join(rootDir, "vendor", "electron-runtime-win32-x64-41.5.0.zip");
 
 function commandName(name) {
   return process.platform === "win32" ? `${name}.cmd` : name;
@@ -59,7 +60,25 @@ function withIconHookEnv(workDir) {
   };
 }
 
+async function assertRuntimeZipReady() {
+  const stat = await fs.stat(runtimeZipPath);
+  if (stat.size < 50 * 1024 * 1024) {
+    throw new Error(`Electron runtime zip is incomplete (${stat.size} bytes): ${runtimeZipPath}. Run git lfs pull before building.`);
+  }
+  const handle = await fs.open(runtimeZipPath, "r");
+  try {
+    const header = Buffer.alloc(4);
+    await handle.read(header, 0, header.length, 0);
+    if (header[0] !== 0x50 || header[1] !== 0x4b) {
+      throw new Error(`Electron runtime zip is not a ZIP file: ${runtimeZipPath}. Run git lfs pull before building.`);
+    }
+  } finally {
+    await handle.close();
+  }
+}
+
 await fs.mkdir(distDir, { recursive: true });
+await assertRuntimeZipReady();
 await run(process.execPath, [path.join(rootDir, "scripts", "generate-icon.mjs")]);
 
 const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "claude-cn-pkg-"));
