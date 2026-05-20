@@ -12,6 +12,7 @@ import {
   applyCodeOrgDisabledGatePatch,
   applyMaxEffortPatchRules,
   buildMainProcessPatch,
+  patchGatewayUrlValidation,
   patchMacDesktopUserAgent,
   patchUltraLocalBridge,
   prepareMacPortableRuntime,
@@ -794,6 +795,28 @@ function testUltraLocalBridgePatch(recorder) {
   recorder.check("Ultra bridge 会包装 setModel 入参", patched.includes("self._uM?.(A)||A"));
 }
 
+function testGatewayUrlValidationPatch(recorder) {
+  const fixture = [
+    'function jVe(e={}){return s8(A=>A,Kr().trim().url().refine(A=>{try{const{protocol:t,hostname:i}=new URL(A);return t==="https:"?!0:!!e.allowLoopbackHttp&&t==="http:"&&VVe.has(i)}catch{return!1}},{message:e.allowLoopbackHttp?"must use https (or http on loopback)":"must use https"}))}',
+    'function aY(t={}){return p_(e=>e,De().trim().url().refine(e=>{try{const{protocol:n,hostname:r}=new URL(e);return n==="https:"?!0:!!t.allowLoopbackHttp&&n==="http:"&&iY.has(r)}catch{return!1}},{message:t.allowLoopbackHttp?"must use https (or http on loopback)":"must use https"}))}',
+    'function S6(e){return Kr().trim().url().refine(A=>{try{const{protocol:r}=new URL(A);return r==="https:"}catch{return!1}},{message:"must use https"})}',
+    'function patchedBefore(e){return Kr().trim().url().refine(A=>{try{const{protocol:q,hostname:h}=new URL(A);return q==="https:"||q==="http:"}catch{return!1}},{message:"must use http or https"})}',
+    'async function oauth(e){const A=u=>u.protocol==="https:"||u.protocol==="http:"&&u.hostname==="127.0.0.1",t=new URL(e.authorizationUrl);if(!A(t))throw new Error("authorizationUrl must use https (or http on 127.0.0.1)");if(!A(new URL(e.tokenUrl)))throw new Error("tokenUrl must use https (or http on 127.0.0.1)")}',
+    'async function issuer(e){const A=new URL(e.issuer),t=A.protocol==="http:"&&A.hostname==="127.0.0.1";if(A.protocol!=="https:"&&!t)throw new Error("inferenceGatewayOidc issuer must be https");return t}',
+    'function discovery(o,t){for(const[s,a]of[["authorization_endpoint",o.authorization_endpoint],["token_endpoint",o.token_endpoint]]){let g;try{g=new URL(a)}catch{g=void 0}if(!((g==null?void 0:g.protocol)==="https:"||t&&(g==null?void 0:g.protocol)==="http:"&&g.hostname==="127.0.0.1"))throw new Error(`OIDC discovery returned non-https ${s}`);}}'
+  ].join(";");
+  const patched = patchGatewayUrlValidation(fixture);
+
+  recorder.check("Gateway URL 校验不再限制协议", patched.includes("new URL(A);return !0"));
+  recorder.check("Gateway preload URL 校验不再限制协议", patched.includes("new URL(e);return !0"));
+  recorder.check("Gateway 严格 https 校验会被放开", patched.includes("const{protocol:r}=new URL(A);return !0"));
+  recorder.check("Gateway 旧版 http/https 补丁会继续放开", patched.includes("const{protocol:q,hostname:h}=new URL(A);return !0"));
+  recorder.check("Gateway OAuth endpoint 校验不再限制到 https 或 127.0.0.1", patched.includes("const A=u=>!0"));
+  recorder.check("Gateway OIDC issuer 校验不再限制到 https 或 127.0.0.1", patched.includes("const A=new URL(e.issuer),t=!0;return t"));
+  recorder.check("Gateway OIDC discovery 校验不再限制到 https 或 127.0.0.1", patched.includes("if(!g)throw new Error(`OIDC discovery returned invalid ${s}`);"));
+  recorder.check("Gateway URL 校验不再限制到 https 或 loopback", !patched.includes("allowLoopbackHttp&&") && !patched.includes("http on loopback") && !patched.includes("must use https") && !patched.includes('hostname==="127.0.0.1"') && !patched.includes('==="https:"||'));
+}
+
 function testCodeOrgDisabledGatePatch(recorder) {
   const fixture = 'function yj({children:t}){const e=rt(),r=p(),n=d(),o=!y(),a=G(),u=$(),c=i("baku_enabled"),l=V(),s=!1===l,{onboardingPage:f,isLoading:h,hasError:v,environments:m,hasRunnerPools:b,refetch:g}=nj(),w=m&&m.length>0||b,O=n?.startsWith("/code/onboarding"),x="/code/family"===n,j=n?.startsWith("/code/disabled"),S=n?.startsWith("/code/share/"),P=n?.startsWith("/code/security"),E=n?.startsWith("/code/session_")||n?.startsWith("/code/cse_"),A=H.useMemo(()=>n?.startsWith("/code")||n?.startsWith("/claude-ship")?S?null:P?`/security${window.location.search}`:c&&n?.startsWith("/claude-ship")?s?"/code/disabled":a?null:"/upgrade":u||void 0===l?"loading":s?j?null:"/code/disabled":j&&!s?"/code":a?O?v?"error":null===f?"/code":null:E?null:h?"loading":v?"error":w?x?"/code":null:x?null:"/code/family":x?null:o?"https://claude.com/product/claude-code":"https://claude.com/product/claude-code?reason=no_org_access":null,[a,n,o,w,u,c,h,v,f,O,x,S,P,E,j,l,s]);return A}';
   const result = applyCodeOrgDisabledGatePatch(fixture);
@@ -903,6 +926,7 @@ export async function runWindowsSelfTest({ rootDir, flags = {}, logger = console
     testUltraMenuStableInteraction(recorder);
     testBaiduSkillDescriptionTranslation(recorder);
     testUltraLocalBridgePatch(recorder);
+    testGatewayUrlValidationPatch(recorder);
     testCodeOrgDisabledGatePatch(recorder);
     testMacDesktopUserAgentPatch(recorder);
     testMaxEffortPatchKeepsModelMenuPrimary(recorder);

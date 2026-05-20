@@ -15,7 +15,7 @@ const MAIN_PROCESS_PATCH_MARKER = "CLAUDE_CN_MAIN_PROCESS_PATCH_V13_BAIDU_TRANSL
 const ULTRA_MAX_EFFORT_PATCH_MARKER = "CLAUDE_ULTRA_MAX_EFFORT_PATCH";
 const NATIVE_LANGUAGE_LIST_PATCH_MARKER = "CLAUDE_ULTRA_NATIVE_LANGUAGE_LIST_PATCH";
 const CODE_ORG_DISABLED_GATE_PATCH_MARKER = "CLAUDE_ULTRA_CODE_ORG_DISABLED_GATE_PATCH";
-const PORTABLE_COMPATIBILITY_PATCH_VERSION = 8;
+const PORTABLE_COMPATIBILITY_PATCH_VERSION = 12;
 const MAC_RUNTIME_APP_NAME = "Claude ultra";
 const MAC_RUNTIME_BUNDLE_IDENTIFIER = "com.claudeultra.runtime";
 const MAC_RUNTIME_IDENTITY_VERSION = 2;
@@ -1141,6 +1141,51 @@ function patchGatewayHealthModelSelector(content) {
   return nextContent;
 }
 
+export function patchGatewayUrlValidation(content) {
+  const protocolValidationPattern = /(const\{protocol:([A-Za-z_$][\w$]*)(?:,[^}]*)?\}=new URL\([^)]+\);)return (?:\2==="https:"\?!0:!![A-Za-z_$][\w$]*\.allowLoopbackHttp&&\2==="http:"&&[A-Za-z_$][\w$]*\.has\([A-Za-z_$][\w$]*\)|\2==="https:"\|\|\2==="http:"|\2==="https:")/g;
+  let nextContent = content.replace(
+    protocolValidationPattern,
+    (_match, prefix) => `${prefix}return !0`
+  );
+  nextContent = nextContent.replace(
+    /const ([A-Za-z_$][\w$]*)=([A-Za-z_$][\w$]*)=>\2\.protocol==="https:"\|\|\2\.protocol==="http:"&&\2\.hostname==="127\.0\.0\.1"/g,
+    (_match, functionName, urlName) => `const ${functionName}=${urlName}=>!0`
+  );
+  nextContent = nextContent.replace(
+    /const ([A-Za-z_$][\w$]*)=([A-Za-z_$][\w$]*)\.protocol==="http:"&&\2\.hostname==="127\.0\.0\.1";if\(\2\.protocol!=="https:"&&!\1\)throw new Error\("[^"]*Oidc issuer must be https"\);/g,
+    (_match, loopbackName) => `const ${loopbackName}=!0;`
+  );
+  nextContent = nextContent.replace(
+    /,([A-Za-z_$][\w$]*)=([A-Za-z_$][\w$]*)\.protocol==="http:"&&\2\.hostname==="127\.0\.0\.1";if\(\2\.protocol!=="https:"&&!\1\)throw new Error\("[^"]*Oidc issuer must be https"\);/g,
+    (_match, loopbackName) => `,${loopbackName}=!0;`
+  );
+  nextContent = nextContent.replace(
+    /if\(![A-Za-z_$][\w$]*\([A-Za-z_$][\w$]*\)\)throw new Error\("authorizationUrl must use https \(or http on 127\.0\.0\.1\)"\);/g,
+    ""
+  );
+  nextContent = nextContent.replace(
+    /if\(![A-Za-z_$][\w$]*\(new URL\(([^)]+)\)\)\)throw new Error\("tokenUrl must use https \(or http on 127\.0\.0\.1\)"\);?/g,
+    (_match, tokenUrlExpression) => `new URL(${tokenUrlExpression});`
+  );
+  nextContent = nextContent.replace(
+    /if\(!\(\(([A-Za-z_$][\w$]*)==null\?void 0:\1\.protocol\)==="https:"\|\|[A-Za-z_$][\w$]*&&\(\1==null\?void 0:\1\.protocol\)==="http:"&&\1\.hostname==="127\.0\.0\.1"\)\)throw new Error\(`OIDC discovery returned non-https \$\{([A-Za-z_$][\w$]*)\}`\);/g,
+    (_match, urlName, endpointName) => `if(!${urlName})throw new Error(\`OIDC discovery returned invalid \${${endpointName}}\`);`
+  );
+  nextContent = nextContent.replace(
+    /message:[A-Za-z_$][\w$]*\.allowLoopbackHttp\?"must use https \(or http on loopback\)":"must use https"/g,
+    'message:"invalid url"'
+  );
+  nextContent = nextContent.replace(
+    /message:"must use http or https"/g,
+    'message:"invalid url"'
+  );
+  nextContent = nextContent.replace(
+    /message:"must use https"/g,
+    'message:"invalid url"'
+  );
+  return nextContent;
+}
+
 function patchCoworkMsixCheck(content) {
   const msixCheckPattern = /if\((\w+)==="win32"&&!\w+\(\)\)return\{status:"unsupported",reason:\w+\(\)\.formatMessage\(\{defaultMessage:"Cowork requires Claude Desktop be installed with our modern installer",id:"EmeqFY8DA1"\}\),unsupportedCode:"msix_required"\};/;
   const nextContent = content.replace(
@@ -1254,6 +1299,30 @@ async function patchCodeOrgDisabledGate(resourcesDir) {
   };
 }
 
+async function patchIonDistGatewayUrlValidation(resourcesDir) {
+  const ionDistDir = path.join(resourcesDir, "ion-dist");
+  if (!(await pathExists(ionDistDir))) {
+    return { patched: 0, rules: [] };
+  }
+
+  let patched = 0;
+  for (const filePath of await findJavaScriptFiles(ionDistDir)) {
+    const content = await fs.readFile(filePath, "utf8");
+    const nextContent = patchGatewayUrlValidation(content);
+    if (nextContent === content) {
+      continue;
+    }
+
+    await fs.writeFile(filePath, nextContent, "utf8");
+    patched += 1;
+  }
+
+  return {
+    patched,
+    rules: patched > 0 ? ["gateway-url-validation"] : []
+  };
+}
+
 async function patchPortableCompatibility(resourcesDir) {
   const asarPath = path.join(resourcesDir, "app.asar");
   if (!(await pathExists(asarPath))) {
@@ -1263,12 +1332,12 @@ async function patchPortableCompatibility(resourcesDir) {
   const result = await patchAsarFile(asarPath, [
     {
       file: ".vite/build/index.js",
-      transform: (content) => patchUltraLocalBridge(patchMacDesktopUserAgent(patchMacSharedConfigWrites(patchMacVirtualizationEntitlementCheck(patchCoworkMsixCheck(patchGatewayHealthModelSelector(content)))))),
+      transform: (content) => patchUltraLocalBridge(patchGatewayUrlValidation(patchMacDesktopUserAgent(patchMacSharedConfigWrites(patchMacVirtualizationEntitlementCheck(patchCoworkMsixCheck(patchGatewayHealthModelSelector(content))))))),
       inPlace: true
     },
     {
       file: ".vite/build/index.pre.js",
-      transform: patchMacVirtualizationEntitlementCheck,
+      transform: (content) => patchGatewayUrlValidation(patchMacVirtualizationEntitlementCheck(content)),
       inPlace: true
     },
     {
@@ -1283,10 +1352,12 @@ async function patchPortableCompatibility(resourcesDir) {
     }
   ]);
   const codeGateStats = await patchCodeOrgDisabledGate(resourcesDir);
+  const urlValidationStats = await patchIonDistGatewayUrlValidation(resourcesDir);
   return {
     ...result,
-    patched: result.patched + codeGateStats.patched,
+    patched: result.patched + codeGateStats.patched + urlValidationStats.patched,
     codeGateStats,
+    urlValidationStats,
     version: PORTABLE_COMPATIBILITY_PATCH_VERSION
   };
 }
