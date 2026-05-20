@@ -5,3 +5,7 @@ dist/
 
 *.tmp
 *.log
+
+# Original Claude Desktop installers/packages used only for local testing.
+Claude Setup*.exe
+Claude-*.msix

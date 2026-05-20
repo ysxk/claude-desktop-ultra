@@ -1,7 +1,7 @@
 {
   "id": "claude-desktop.zh-cn-overlay",
   "name": "Claude ultra",
-  "version": "0.1.6",
+  "version": "0.1.8",
   "entry": "bin/claude-cn.mjs",
   "target": {
     "app": "Claude Desktop",
