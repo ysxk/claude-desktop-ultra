@@ -10,8 +10,8 @@ Claude ultra 是一个 Claude Desktop 增强器。macOS 会在用户目录生成
 - 原生中文语言选项：保留官方英文资源，并在 Claude 自带语言设置里额外加入 `简体中文 (zh-CN)`。
 - 默认中文启动：默认以 `zh-CN` 启动 Claude，同时仍可从 Claude 原生语言设置切回其他语言。
 - UI 汉化增强：写入 `zh-CN.json`，并通过主进程 / preload 注入补足设置页、开发者模式等动态界面的翻译。
-- 第三方模型解锁：同步 Claude-3p Gateway 的 `/v1/models` 到 Claude-3p 配置，写入 `inferenceModels` 并关闭模型校验限制，让 Claude 显示非官方模型。
-- 跨机器网关兼容：启动时会把更可能可用的第三方模型排到第一位，并在存在静态 Gateway API Key 时探测可用模型，避免 Claude 健康检查误选无权限的 Sonnet / Haiku / Opus。
+- 第三方模型解锁：关闭模型校验限制，让 Claude 显示非官方模型；已有 Gateway 配置默认保持 `/v1/models` 动态发现，避免写死首次模型列表。
+- 跨机器网关兼容：显式提供 `--models` 或初始化空白配置时仍可写入静态 `inferenceModels`，并在存在静态 Gateway API Key 时探测可用模型，避免 Claude 健康检查误选无权限的 Sonnet / Haiku / Opus。
 - 模型同步诊断：如果目标电脑没有 Claude-3p Gateway 配置，会输出缺失项、配置文件路径和可直接运行的修复命令。
 - 空白机器 3P 初始化：首次写入第三方模型时会自动创建 Claude 认可的 `configLibrary/_meta.json`，并把 `deploymentMode` 切到 `3p`。
 - 旧版配置迁移：如果之前版本写过 `configLibrary/default.json`，新版会迁移到 Claude 真正读取的 UUID 配置文件。
@@ -123,6 +123,8 @@ npm run build:dmg
 ```powershell
 .\dist\ClaudeCN.exe models
 ```
+
+已有 Gateway 配置会保留动态 `/v1/models` 发现；如果旧版自动写入过静态 `inferenceModels`，新版会清理这类自动生成列表。只有显式传入 `--models` 时，才会把模型列表固定写入配置。
 
 如果目标电脑还没有配置，可以用命令写入基础配置：
 

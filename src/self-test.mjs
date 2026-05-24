@@ -269,7 +269,7 @@ async function testLegacyModelMigration(recorder, gateway) {
   }
 }
 
-async function testGatewayModelRefreshReplacesStaleModels(recorder) {
+async function testGatewayModelRefreshKeepsDynamicDiscovery(recorder) {
   const gateway = await startFakeGateway({
     models: [
       { id: "gpt-new-chat" },
@@ -302,7 +302,54 @@ async function testGatewayModelRefreshReplacesStaleModels(recorder) {
       "utf8"
     );
 
-    await syncThirdPartyModels({
+    const result = await syncThirdPartyModels({
+      rootDir,
+      gatewayBaseUrl: gateway.baseUrl,
+      gatewayApiKey: "new-key",
+      probeModels: false,
+      gatewayTimeoutMs: 2000
+    });
+    const config = await validateModelConfig(rootDir);
+    const hasStaticModelList = Object.hasOwn(config.config, "inferenceModels");
+
+    recorder.check("已有 Gateway 配置不会写死自动发现模型列表", !hasStaticModelList, JSON.stringify(config.config.inferenceModels || null));
+    recorder.check("同步结果仍返回新 Gateway 模型", result.models.includes("gpt-new-chat") && result.models.includes("qwen-new-chat"), result.models.join(", "));
+    recorder.check("旧版自动生成模型列表会被清理", result.modelListMode === "dynamic-cleared-generated", result.modelListMode);
+  } finally {
+    await gateway.close();
+    await fs.rm(rootDir, { recursive: true, force: true });
+  }
+}
+
+async function testManualGatewayModelListIsPreserved(recorder) {
+  const gateway = await startFakeGateway({
+    models: [{ id: "gpt-new-chat" }]
+  });
+  const rootDir = await makeTempDir("claude-ultra-manual-models-");
+  try {
+    const appliedId = "22222222-2222-4222-8222-222222222222";
+    const libraryDir = path.join(rootDir, "configLibrary");
+    await fs.mkdir(libraryDir, { recursive: true });
+    await fs.writeFile(
+      path.join(libraryDir, "_meta.json"),
+      `${JSON.stringify({
+        appliedId,
+        entries: [{ id: appliedId, name: "Manual config" }]
+      }, null, 2)}\n`,
+      "utf8"
+    );
+    await fs.writeFile(
+      path.join(libraryDir, `${appliedId}.json`),
+      `${JSON.stringify({
+        inferenceProvider: "gateway",
+        inferenceGatewayBaseUrl: "http://127.0.0.1:1",
+        inferenceGatewayApiKey: "manual-key",
+        inferenceModels: [{ name: "manually-pinned", labelOverride: "Pinned by user" }]
+      }, null, 2)}\n`,
+      "utf8"
+    );
+
+    const result = await syncThirdPartyModels({
       rootDir,
       gatewayBaseUrl: gateway.baseUrl,
       gatewayApiKey: "new-key",
@@ -312,8 +359,8 @@ async function testGatewayModelRefreshReplacesStaleModels(recorder) {
     const config = await validateModelConfig(rootDir);
     const modelNames = config.config.inferenceModels?.map((model) => model.name) || [];
 
-    recorder.check("新 Gateway 模型会替换旧模型列表", modelNames.includes("gpt-new-chat") && modelNames.includes("qwen-new-chat"), modelNames.join(", "));
-    recorder.check("旧 Gateway 独有模型会被删除", !modelNames.includes("old-site-only"), modelNames.join(", "));
+    recorder.check("手动模型列表会被保留", modelNames.includes("manually-pinned"), modelNames.join(", "));
+    recorder.check("手动模型列表不会被误判为旧版自动列表", result.modelListMode === "preserved-existing", result.modelListMode);
   } finally {
     await gateway.close();
     await fs.rm(rootDir, { recursive: true, force: true });
@@ -933,7 +980,8 @@ export async function runWindowsSelfTest({ rootDir, flags = {}, logger = console
     await testEmptyConfigDoesNotActivate(recorder);
     await testBlankModelSync(recorder, gateway);
     await testLegacyModelMigration(recorder, gateway);
-    await testGatewayModelRefreshReplacesStaleModels(recorder);
+    await testGatewayModelRefreshKeepsDynamicDiscovery(recorder);
+    await testManualGatewayModelListIsPreserved(recorder);
     if (!flags.skipRuntime) {
       await testPortableRuntime(recorder, rootDir, flags);
     }

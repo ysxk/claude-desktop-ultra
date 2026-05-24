@@ -411,6 +411,25 @@ function modelEntry(model) {
   };
 }
 
+function isGeneratedModelEntry(entry) {
+  if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
+    return false;
+  }
+
+  const keys = Object.keys(entry);
+  return keys.length === 2
+    && keys.includes("name")
+    && keys.includes("labelOverride")
+    && typeof entry.name === "string"
+    && entry.labelOverride === displayLabel(entry.name);
+}
+
+function hasGeneratedModelList(config) {
+  return Array.isArray(config.inferenceModels)
+    && config.inferenceModels.length > 0
+    && config.inferenceModels.every(isGeneratedModelEntry);
+}
+
 export async function syncThirdPartyModels(options = {}) {
   const paths = await getAppliedConfigPath(options.rootDir);
   const configExists = await pathExists(paths.configPath);
@@ -446,7 +465,14 @@ export async function syncThirdPartyModels(options = {}) {
       ?? process.env.CLAUDE_3P_MODELS
   );
   const existingModels = configuredModelNames(config);
-  const shouldUseExistingModels = requestedModels.length === 0 && !fetchedGatewayModels;
+  const shouldPreferDynamicGatewayModels = configExists
+    && !legacyConfigMigrated
+    && requestedModels.length === 0
+    && options.persistDiscoveredModels !== true
+    && canFetchGatewayModels(config);
+  const shouldUseExistingModels = requestedModels.length === 0
+    && !fetchedGatewayModels
+    && !shouldPreferDynamicGatewayModels;
   const discoveredModels = [...new Set([
     ...requestedModels,
     ...fetchedModels,
@@ -472,15 +498,40 @@ export async function syncThirdPartyModels(options = {}) {
     probeModels: options.probeModels !== false
   });
   const models = promoteModel(orderedModels, probeResult.model);
+  const existingGeneratedModelList = hasGeneratedModelList(config);
+  const buildNextConfig = () => {
+    const nextConfig = {
+      ...config,
+      unstableDisableModelVerification: true
+    };
+
+    if (shouldPreferDynamicGatewayModels) {
+      if (existingGeneratedModelList) {
+        delete nextConfig.inferenceModels;
+      }
+      return nextConfig;
+    }
+
+    if (models.length > 0) {
+      nextConfig.inferenceModels = models.map(modelEntry);
+    } else if (fetchedGatewayModels || requestedModels.length > 0) {
+      nextConfig.inferenceModels = [];
+    }
+
+    return nextConfig;
+  };
+  const modelListMode = shouldPreferDynamicGatewayModels
+    ? existingGeneratedModelList
+      ? "dynamic-cleared-generated"
+      : Array.isArray(config.inferenceModels)
+        ? "preserved-existing"
+        : "dynamic"
+    : "static";
 
   if (models.length === 0) {
     let configChanged = false;
     if (shouldActivateThirdParty) {
-      const nextConfig = {
-        ...config,
-        ...(fetchedGatewayModels || requestedModels.length > 0 ? { inferenceModels: [] } : {}),
-        unstableDisableModelVerification: true
-      };
+      const nextConfig = buildNextConfig();
       const previous = JSON.stringify(config);
       const next = JSON.stringify(nextConfig);
       const shouldWriteConfig = previous !== next || legacyConfigMigrated || !(await pathExists(paths.configPath));
@@ -503,17 +554,14 @@ export async function syncThirdPartyModels(options = {}) {
       probeSkipped: probeResult.skipped || null,
       probeFailures: probeResult.failures || [],
       fetchError,
+      modelListMode,
       metaChanged: metaResult.changed,
       deploymentMode,
       ...diagnostic
     };
   }
 
-  const nextConfig = {
-    ...config,
-    inferenceModels: models.map(modelEntry),
-    unstableDisableModelVerification: true
-  };
+  const nextConfig = buildNextConfig();
 
   const previous = JSON.stringify(config);
   const next = JSON.stringify(nextConfig);
@@ -535,6 +583,7 @@ export async function syncThirdPartyModels(options = {}) {
     probeSkipped: probeResult.skipped || null,
     probeFailures: probeResult.failures || [],
     fetchError,
+    modelListMode,
     metaChanged: metaResult.changed,
     deploymentMode,
     ...diagnostic

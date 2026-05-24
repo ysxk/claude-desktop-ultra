@@ -811,6 +811,13 @@ async function runModelSync(flags = {}) {
       if (result.fetchError) {
         logger.warn(`读取 Gateway /v1/models 失败，已使用现有/手动模型列表：${result.fetchError}`);
       }
+      if (result.modelListMode === "dynamic-cleared-generated") {
+        logger.info("已移除旧版自动写入的静态模型列表；后续由 Gateway /v1/models 动态发现。");
+      } else if (result.modelListMode === "dynamic") {
+        logger.info("Gateway 模型列表保持动态发现，未写入静态 inferenceModels。");
+      } else if (result.modelListMode === "preserved-existing") {
+        logger.info("检测到现有手动模型列表，已保留。");
+      }
       if (result.metaChanged) {
         logger.info(`已创建 / 修复 Claude-3p 配置索引：${result.metaPath}`);
       }
@@ -837,6 +844,13 @@ async function runModelSync(flags = {}) {
       }
       if (result.fetchError) {
         logger.warn(`读取 Gateway /v1/models 失败：${result.fetchError}`);
+      }
+      if (result.modelListMode === "dynamic-cleared-generated") {
+        logger.info("已移除旧版自动写入的静态模型列表；后续由 Gateway /v1/models 动态发现。");
+      } else if (result.modelListMode === "dynamic") {
+        logger.info("Gateway 模型列表保持动态发现，未写入静态 inferenceModels。");
+      } else if (result.modelListMode === "preserved-existing") {
+        logger.info("检测到现有手动模型列表，已保留。");
       }
       logger.info("可在目标电脑运行：ClaudeCN.exe models --gateway-base-url <url> --gateway-api-key <key> --models <model1,model2>");
     }
